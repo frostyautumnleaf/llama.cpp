@@ -2114,8 +2114,11 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         size_t cache_size = 0; // number of tokens in n-gram cache
 
         common_ngram_cache ngram_cache_context;
-        common_ngram_cache ngram_cache_dynamic;
-        common_ngram_cache ngram_cache_static;
+
+        // the caches read from disk are never written to, and a copy per sequence of a static cache built from a
+        // big corpus costs the RAM that the cache was made to save: share one instead
+        std::shared_ptr<const common_ngram_cache> ngram_cache_dynamic;
+        std::shared_ptr<const common_ngram_cache> ngram_cache_static;
     };
 
     std::vector<seq_info> sinfos;
@@ -2144,7 +2147,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
         if (!path_static.empty()) {
             try {
-                auto ngram_cache_static = common_ngram_cache_load(path_static);
+                auto ngram_cache_static = common_ngram_cache_load_shared(path_static);
 
                 for (auto & sinfo : sinfos) {
                     sinfo.ngram_cache_static = ngram_cache_static;
@@ -2157,7 +2160,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
         if (!path_dynamic.empty()) {
             try {
-                auto ngram_cache_dynamic = common_ngram_cache_load(path_dynamic);
+                auto ngram_cache_dynamic = common_ngram_cache_load_shared(path_dynamic);
 
                 for (auto & sinfo : sinfos) {
                     sinfo.ngram_cache_dynamic = ngram_cache_dynamic;
@@ -2209,8 +2212,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         common_ngram_cache_draft(
                 inp, result, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
                 sinfo.ngram_cache_context,
-                sinfo.ngram_cache_dynamic,
-                sinfo.ngram_cache_static);
+                *sinfo.ngram_cache_dynamic,
+                *sinfo.ngram_cache_static);
 
         if (result.size() > 0) {
             // delete first token in result (which is the id_last token)
@@ -2262,22 +2265,6 @@ static common_ngram_map get_common_ngram_map(
     uint16_t min_hits   = config.min_hits;
 
     return common_ngram_map(size_key, size_value, key_only, min_hits);
-}
-
-static common_speculative_impl_ngram_cache create_state_ngram_cache(
-        const common_speculative_config & config,
-        uint32_t n_seq,
-        const std::string & path_static,
-        const std::string & path_dynamic) {
-    uint16_t n_draft = 8; // TODO get from config?
-
-    // TODO bool param in common/common.h to set save_static/save_dynamic?
-    bool save_static = false;
-    bool save_dynamic = false;
-
-    common_speculative_impl_ngram_cache state(config.params, n_seq, n_draft, path_static, path_dynamic, save_static, save_dynamic);
-
-    return state;
 }
 
 std::string common_speculative_type_name_str(const std::vector<common_speculative_type> & types) {
@@ -2770,11 +2757,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {
-                auto state = create_state_ngram_cache(
-                        config, n_seq,
-                        params.ngram_cache.lookup_cache_static,
-                        params.ngram_cache.lookup_cache_dynamic);
-                impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                // built in place: the loaded caches are shared, so the state cannot be copied through a helper
+                impls.push_back(
+                        std::make_unique<common_speculative_impl_ngram_cache>(
+                            config.params,
+                            n_seq,
+                            8, // TODO get n_draft from config?
+                            params.ngram_cache.lookup_cache_static,
+                            params.ngram_cache.lookup_cache_dynamic,
+                            false, // TODO bool param in common/common.h to set save_dynamic?
+                            false)); // TODO bool param in common/common.h to set save_static?
                 break;
             }
             default:
