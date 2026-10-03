@@ -11,8 +11,8 @@
 //         own.
 //
 // build:
-//   g++ -std=c++17 -O2 -I common -I include -I ggml/include tests/test-ngram-cache.cpp common/ngram-cache.cpp \
-//       -o test-ngram-cache
+//   g++ -std=c++17 -O2 -I common -I include -I ggml/include
+//       tests/test-ngram-cache.cpp common/ngram-cache.cpp -o test-ngram-cache
 // run:
 //   ./test-ngram-cache                      # unit + equivalence tests
 //   ./test-ngram-cache --bench ref|new      # benchmark
@@ -313,7 +313,7 @@ static best best_of(const part & primary, const part & st, int n_index, const in
 // with the strongest primary count (the threshold is tested on that count)
 static best best_of_strongest(const part & primary, const part & st, int n_index, const int * a, const int * p) {
     best out;
-    int64_t max_primary = 0, max_static = 0, max_product = 0;
+    int64_t max_primary = 0, max_product = 0;
     for (auto & kv : primary) {
         const int64_t count_primary = kv.second;
         const auto    it            = st.find(kv.first);
@@ -322,7 +322,6 @@ static best best_of_strongest(const part & primary, const part & st, int n_index
         if (product > max_product || (product == max_product && count_primary > max_primary)) {
             out.token   = kv.first;
             max_primary = count_primary;
-            max_static  = count_static;
             max_product = product;
         }
         out.sum += count_primary;

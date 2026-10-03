@@ -333,7 +333,6 @@ static llama_token try_draft(
 
         llama_token max_token         = LLAMA_TOKEN_NULL;
         int64_t     max_count_primary = 0;
-        int64_t     max_count_static  = 0;
         int64_t     max_product       = 0;
 
         if (part_static.empty()) {
@@ -354,7 +353,6 @@ static llama_token try_draft(
                 if (product > max_product || (product == max_product && count_primary > max_count_primary)) {
                     max_token         = e->token;
                     max_count_primary = count_primary;
-                    max_count_static  = count_static;
                     max_product       = product;
                 }
             }
