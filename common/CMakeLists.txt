@@ -92,6 +92,7 @@ add_library(${TARGET}
     log.cpp
     log.h
     ngram-cache.cpp
+    ngram-suffix.cpp
     ngram-cache.h
     ngram-map.cpp
     ngram-map.h
