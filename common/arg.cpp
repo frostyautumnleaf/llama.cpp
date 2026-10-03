@@ -4312,6 +4312,57 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
+        {"--spec-ngram-suffix-n-max"}, "N",
+        string_format("longest lookup draft for ngram-suffix speculative decoding; the verify window is N + 1 tokens "
+            "(default: %d)", params.speculative.ngram_suffix.n_max),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 7) {
+                throw std::invalid_argument("ngram-suffix n-max must be between 1 and 7 inclusive");
+            }
+            params.speculative.ngram_suffix.n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-min-match"}, "N",
+        string_format("shortest repeat of the generated suffix that ngram-suffix drafts from (default: %d)", params.speculative.ngram_suffix.min_match),
+        [](common_params & params, int value) {
+            if (value < 3 || value > 1024) {
+                throw std::invalid_argument("ngram-suffix min-match must be between 3 and 1024 inclusive");
+            }
+            params.speculative.ngram_suffix.min_match = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-max-match"}, "N",
+        string_format("longest repeat of the generated suffix ngram-suffix looks for (default: %d)", params.speculative.ngram_suffix.max_match),
+        [](common_params & params, int value) {
+            if (value < 3 || value > 4096) {
+                throw std::invalid_argument("ngram-suffix max-match must be between 3 and 4096 inclusive");
+            }
+            params.speculative.ngram_suffix.max_match = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-margin"}, "P",
+        string_format("how much faster than the alternative a lookup verify window has to be expected to pay for "
+            "itself (default: %.2f)", (double) params.speculative.ngram_suffix.margin),
+        [](common_params & params, const std::string & value) {
+            const float margin = std::stof(value);
+            if (!(margin >= 0.0f && margin <= 10.0f)) {
+                throw std::invalid_argument("ngram-suffix margin must be between 0 and 10 inclusive");
+            }
+            params.speculative.ngram_suffix.margin = margin;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-fixed"},
+        "draft the whole lookup proposal instead of letting the draft policy choose the window "
+        "(the policy is what keeps a long lookup window off ordinary text; default: off)",
+        [](common_params & params) {
+            params.speculative.ngram_suffix.adaptive = false;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",
         string_format("ngram size N for ngram-simple speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_simple.size_n),
         [](common_params & params, int value) {

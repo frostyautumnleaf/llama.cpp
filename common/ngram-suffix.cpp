@@ -243,7 +243,8 @@ common_draft_policy::pick common_draft_policy::choose(int t_mtp, int lookup_k, i
         return p;
     }
 
-    const double base = mtp_tokens(p.t) / cost_ms(p.t);
+    // the alternative: the model's own drafts at the cost of their window, or one token per plain round
+    const double base = has_mtp_ ? mtp_tokens(p.t) / cost_ms(p.t) : 1.0 / cost_ms(1);
     const double q    = lookup_rate(match);
 
     double e     = 1.0;

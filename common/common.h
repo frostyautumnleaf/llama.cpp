@@ -183,6 +183,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX,  // longest-match suffix lookup with an adaptive verify window
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -372,6 +373,17 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+// longest-match prompt lookup, ported from the Strata inference engine: the tokens that followed the longest
+// earlier repeat of the sequence's suffix are proposed, and the draft policy decides whether they or the model's
+// own drafts should fill the verify window - see common/ngram-suffix.h
+struct common_params_speculative_ngram_suffix {
+    int32_t n_max     = 7;    // longest lookup draft; the verify window is n_max + 1 tokens
+    int32_t min_match = 16;   // shortest repeat of the suffix worth drafting (Strata: 16)
+    int32_t max_match = 64;   // longest repeat to look for
+    double  margin    = 0.03; // the lookup window has to beat the alternative by this much to be taken
+    bool    adaptive  = true; // let the draft policy choose the window size (false: always draft the full proposal)
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -387,6 +399,8 @@ struct common_params_speculative {
     common_params_speculative_ngram_map ngram_map_k4v;
 
     common_params_speculative_ngram_cache ngram_cache;
+
+    common_params_speculative_ngram_suffix ngram_suffix;
 
     bool has_dft() const {
         return !draft.mparams.empty();

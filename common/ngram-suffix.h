@@ -28,7 +28,9 @@ struct common_suffix_drafter {
     // earlier occurrences a proposal checks; in code a trigram recurs often (Strata: 16)
     static constexpr int WAYS = 16;
 
-    explicit common_suffix_drafter(int min_match = 16, int max_match = 64, size_t capacity_tokens = 1u << 19);
+    // capacity_tokens is only the starting point: the index doubles itself as the history grows, so a small
+    // value costs nothing beyond a first rebuild
+    explicit common_suffix_drafter(int min_match = 16, int max_match = 64, size_t capacity_tokens = 1u << 12);
 
     void reset();
 
@@ -101,6 +103,15 @@ struct common_draft_policy {
 
     explicit common_draft_policy(int max_t = k_max_t, double margin = 0.03);
 
+    // what a declined lookup window falls back to. Strata always has the model's own MTP drafts, so the default
+    // compares against them; with no other drafter configured there is nothing to compare against but plain
+    // decoding, which commits one token a round at the measured cost of a window of 1.
+    void set_fallback(bool mtp) {
+        has_mtp_ = mtp;
+    }
+
+    bool has_fallback_mtp() const { return has_mtp_; }
+
     // t_mtp: the MTP's window size; lookup_k: the lookup proposal's length (0 = none); match: its length
     pick choose(int t_mtp, int lookup_k, int match) const;
 
@@ -116,6 +127,7 @@ private:
 
     int    max_t_;
     double margin_;
+    bool   has_mtp_ = true;
 
     std::vector<double> cost_;     // round ms by window size
     std::vector<double> cost_n_;
