@@ -77,6 +77,21 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error(format("QSA needs a compress ratio above 1 that divides the budget, got %u and %u",
                                         hparams.indexer_kpool, hparams.indexer_top_k));
     }
+    // The MTP block is a QSA layer like the trunk's: beside its own attention it carries an indexer, and QSA pools
+    // one block size for the whole model. Its compress ratio is not in the file, though - the ratio array covers the
+    // trunk and the nextn entries are the zero tail that get_key_or_arr leaves behind (see qwen4exp_require_arr_len
+    // above), and a ratio of 0 reads as "no pooling". The draft layer then attends to every cached cell instead of
+    // the pooled top-k, and the k-pool inputs its graph builds are never consumed: the k-pool input's cell indices
+    // reach set_input with no buffer behind them and ggml_backend_buffer_is_host aborts. Give the nextn range the
+    // ratio the rest of the model shares, so the draft layer pools like the layer it drafts for.
+    for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+        if (hparams.dsv4_compress_ratios[il] == 0 && hparams.n_layer_nextn > 0 && hparams.indexer_kpool > 1) {
+            hparams.dsv4_compress_ratios[il] = hparams.indexer_kpool;
+            LLAMA_LOG_INFO("%s: %s has no compress ratio for the MTP layer %u: using the model's QSA ratio %u\n",
+                    __func__, ml.llm_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS).c_str(), il, hparams.indexer_kpool);
+        }
+    }
+
     // the reference groups the visible tokens in cache order and always keeps the tail
     hparams.indexer_kpool_row         = 2; // raw key | pooled key
     hparams.indexer_kpool_by_order    = true;
@@ -729,6 +744,11 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     ggml_set_input(inp->new_pool_rep);
     inp->new_pool_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*inp->n_new);
     ggml_set_input(inp->new_pool_pos);
+
+    // k_idxs is read by build_qsa_sel's cpy_k, and by nothing else: a graph whose layers all have compress ratio 0
+    // never reaches it, so the tensor would go unallocated and set_input would write through a null buffer. Keep it
+    // in the graph the way the pool inputs above are - set_input fills every one of them, whatever reads them.
+    ggml_build_forward_expand(gf, inp->k_idxs);
 
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }
