@@ -159,6 +159,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_compile_definitions(test-ngram-cache PRIVATE TEST_NGRAM_COMMON_LINKED)
     # the default run is the equivalence tests; pass --sim to the built binary for the round simulator and the benchmark
     llama_build_and_test(test-ngram-suffix.cpp)
+    # drives the ngram-suffix wiring (the chain, the policy's decline, the resync) with a simulated target
+    llama_build_and_test(test-spec-suffix.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
     llama_build_and_test(test-grammar-integration.cpp)

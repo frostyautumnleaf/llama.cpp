@@ -2342,15 +2342,17 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         size_t n = sinfo.n_seen;
 
         if (n > prompt.size() + 1) {
-            sinfo.drafter.reset();
-            n = 0;
+            n = 0; // the sequence shrank: a rollback, or a checkpoint restored under a draft
         } else if (n > 0) {
             const llama_token expect = n - 1 < prompt.size() ? prompt[n - 1] : id_last;
             if (sinfo.drafter.token_at(n - 1) != expect) {
-                sinfo.drafter.reset();
-                n = 0;
+                n = 0; // the token fed in the last round has gone: the sequence changed under the drafter
             }
         }
+
+        // assign(), not reset(): it keeps the prefix the two have in common and undoes the positions past it
+        // newest-first, which leaves the index exactly as appending that prefix alone would have. a rollback on
+        // a 128K-token sequence is then the cost of the rollback, not of the sequence
 
         if (n == prompt.size() + 1) {
             return; // nothing new since the last round
