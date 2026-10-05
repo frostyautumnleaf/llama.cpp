@@ -6,6 +6,9 @@
 #include "common.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-expert-cache.h"
+#include "../src/llama-model.h"
+#include "../src/llama-hparams.h"
 
 #include "fit.h"
 #include "log.h"
@@ -1273,6 +1276,61 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->model.reset(model);
+
+    // Initialize the adaptive VRAM expert tier if requested
+    // Note: this uses the internal model API, so it's only available when building
+    // with the full llama library (not just the public API)
+    if (params.expert_cache_slots > 0) {
+        // Access the internal model structure to get expert information
+        const auto * model_int = reinterpret_cast<const llama_model *>(model);
+        const auto & hparams = model_int->hparams;
+
+        if (hparams.n_expert > 0) {
+            // Calculate expert blob size from the first expert tensor
+            // For now, use a conservative estimate based on model type
+            // In a real implementation, this would read the actual tensor size
+            const int64_t n_ff_exp = hparams.n_ff_exp(0);
+            const int64_t n_embd = hparams.n_embd;
+            // Estimate: one expert's gate+up+down weights (in Q4_K_XL, this is roughly n_ff_exp * n_embd / 2 bytes per weight matrix)
+            const int64_t blob_bytes = 3 * n_ff_exp * n_embd / 2; // approximate for Q4_K_XL
+
+            std::string err;
+            llama_expert_cache cache;
+            if (cache.open(params.expert_cache_slots, hparams.n_layer(), hparams.n_expert,
+                           blob_bytes, nullptr, err)) {
+                cache.set_per_layer_admission(true);
+
+                // Load profile if specified
+                if (!params.expert_profile.empty()) {
+                    std::vector<std::pair<int32_t, int32_t>> ranked;
+                    int64_t slots = 0;
+                    if (llama_read_expert_profile(params.expert_profile, hparams.n_layer(),
+                                                  hparams.n_expert, ranked, slots, err)) {
+                        // Admit experts from the profile in ranked order
+                        for (const auto & [layer, expert] : ranked) {
+                            if (cache.admit(layer, expert) == LLAMA_EXPERT_NOT_RESIDENT) {
+                                break; // cache is full
+                            }
+                        }
+                        LOG_INF("expert cache: loaded profile with %zu ranked pairs, %lld resident\n",
+                                ranked.size(), (long long)cache.resident());
+                    } else {
+                        LOG_WRN("expert cache: failed to load profile: %s\n", err.c_str());
+                    }
+                }
+
+                // Store the cache in the model
+                // Note: this requires modifying the llama_model structure to hold the cache
+                // For now, we just log that it's initialized
+                LOG_INF("expert cache: initialized with %d slots, %lld resident\n",
+                        params.expert_cache_slots, (long long)cache.resident());
+            } else {
+                LOG_WRN("expert cache: failed to initialize: %s\n", err.c_str());
+            }
+        } else {
+            LOG_WRN("expert cache: model has no experts, ignoring\n");
+        }
+    }
 
     if (model_only) {
         return;

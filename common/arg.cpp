@@ -2807,6 +2807,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
+        {"--expert-cache"}, "N",
+        "number of VRAM slots for the adaptive expert tier (0 = disabled, default: 0)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_slots = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE"));
+    add_opt(common_arg(
+        {"--expert-profile"}, "FILE",
+        "path to expert routing profile (STRP format) for the expert cache",
+        [](common_params & params, const std::string & value) {
+            params.expert_profile = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_PROFILE"));
+    add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"

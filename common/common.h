@@ -486,6 +486,10 @@ struct common_params {
     float   yarn_beta_slow        = -1.0f; // YaRN high correction dim
     int32_t yarn_orig_ctx         =     0; // YaRN original context length
 
+    // expert cache (adaptive VRAM expert tier, Strata R4)
+    int32_t expert_cache_slots = 0;     // number of expert cache slots (0 = disabled)
+    std::string expert_profile;         // path to expert routing profile (STRP format)
+
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
