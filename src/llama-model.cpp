@@ -1797,7 +1797,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.done_getting_tensors();
+    // a file that carries an MTP block also carries the scales of the tensors inside it, and a load with MTP off
+    // wants neither: the block's own weights are skipped, the generic pass above never asks for the scales of a
+    // weight it has none of, and the count is then short in the same way it is for a sibling model sharing a .gguf
+    const bool partial_no_mtp = hparams.n_layer_nextn > 0 && hparams.n_layer() > 0 && !ml.load_mtp;
+
+    ml.done_getting_tensors(partial_no_mtp);
 
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);

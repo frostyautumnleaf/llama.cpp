@@ -445,7 +445,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // no outputs means no rows to pick: an out_ids input of length 0 is never given a buffer, and the draft decode
+    // the MTP impl runs on ctx_dft has none (it wants the h rows, which are dense, not logits). Building it anyway
+    // leaves the graph with an input the scheduler hands no buffer to.
+    ggml_tensor * inp_out_ids = n_outputs > 0 ? build_inp_out_ids() : nullptr;
 
     ggml_tensor * ple_emb = nullptr;
     if (hparams.ple_n_heads > 0) {
@@ -589,7 +592,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     }
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // as in the trunk graph: the draft decode of the verify batch carries no output rows, and an out_ids of length
+    // 0 reaches the scheduler with no buffer to be given
+    ggml_tensor * inp_out_ids = n_outputs > 0 ? build_inp_out_ids() : nullptr;
 
     ggml_tensor * h_norm = build_norm(ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens), layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);

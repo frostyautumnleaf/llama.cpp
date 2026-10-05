@@ -1325,6 +1325,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_set_name(&t_meta, tn.str().c_str());
 
+        // a tensor the loader was told to skip - an MTP block in a model loaded without MTP, say. With no file there
+        // is no metadata to skip on, and the skip answer buft_for_tensor gives below is a null buft, which the
+        // assert after it would take for a failure rather than for a skip. The file-backed path answers nullptr.
+        if (flags & TENSOR_SKIP) {
+            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n",
+                    tn.str().c_str(), ggml_nbytes(&t_meta));
+            return nullptr;
+        }
+
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);
         ggml_context * ctx = ctx_for_buft(buft);
