@@ -1594,8 +1594,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     ggml_tensor * res;
     if (expert_cache && expert_cache->valid()) {
         // Use the cached MoE operation
+        // Pass w to slot_tensor() so it can create a properly-shaped view
+        // in the graph context
         res = ggml_mul_mat_id_cached(ctx0, w, cur, ids,
-                                     expert_cache->slot_tensor(),
+                                     expert_cache->slot_tensor(ctx0, w),
                                      expert_cache->residency_table_tensor());
     } else {
         res = ggml_mul_mat_id(ctx0, w, cur, ids);

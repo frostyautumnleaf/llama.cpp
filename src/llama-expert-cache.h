@@ -89,13 +89,17 @@ public:
     struct ggml_tensor* residency_table_tensor() const { return residency_tensor_; }
 
     // Get the slot tensor (for kernel access)
-    struct ggml_tensor* slot_tensor() const { return slot_tensor_; }
+    // If w is provided, returns a properly-shaped view of the slot arena matching w's layout
+    // with ne[2] = n_slots. The view tensor is allocated in the given context.
+    // If w is null, returns the raw 1D byte buffer (legacy).
+    struct ggml_tensor* slot_tensor(struct ggml_context* graph_ctx, const ggml_tensor* w = nullptr) const;
 
     // Number of layers and experts (for kernel use)
     int64_t n_layers() const { return n_layers_; }
     int64_t n_expert() const { return n_expert_; }
 
 private:
+    struct ggml_context* ctx_ = nullptr;
     struct ggml_tensor* slot_tensor_ = nullptr;
     struct ggml_tensor* residency_tensor_ = nullptr;
     void* base_ = nullptr;

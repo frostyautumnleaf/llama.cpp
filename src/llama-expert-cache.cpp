@@ -90,6 +90,7 @@ bool llama_expert_cache::open(int64_t n_slots, int64_t n_layers, int64_t n_exper
         return false;
     }
 
+    ctx_ = ctx;
     const uint64_t want = (uint64_t)n_slots * (uint64_t)blob_bytes;
 
     // Allocate a single tensor for the entire slot arena
@@ -161,6 +162,7 @@ bool llama_expert_cache::open_sized(const std::vector<int64_t>& slot_bytes, int6
 }
 
 void llama_expert_cache::close() {
+    ctx_ = nullptr;
     slot_tensor_ = nullptr;
     residency_tensor_ = nullptr;
     base_ = nullptr;
@@ -263,6 +265,53 @@ bool llama_expert_cache::fill_slot_blocking(int32_t slot, const void* src,
     std::memcpy(dst, src, n);
     ++fills_;
     return true;
+}
+
+struct ggml_tensor* llama_expert_cache::slot_tensor(struct ggml_context* graph_ctx, const ggml_tensor* w) const {
+    if (w == nullptr) {
+        return slot_tensor_;
+    }
+
+    // Create a properly-shaped view of the slot arena matching w's layout.
+    // w has shape [ne0, ne1, n_expert] and we want [ne0, ne1, n_slots].
+    // The strides nb[0], nb[1] are copied from w; nb[2] is the size of one slot.
+    //
+    // The view tensor is allocated in the graph context so it has the same
+    // lifetime as the rest of the graph.
+
+    const int64_t ne0 = w->ne[0];
+    const int64_t ne1 = w->ne[1];
+    const int64_t n_slots = slots_;
+
+    // The size of one slot in bytes is blob_ (for uniform slots)
+    // or off_[1] - off_[0] (for sized slots).
+    int64_t slot_bytes = blob_;
+    if (!off_.empty()) {
+        slot_bytes = (int64_t)(off_[1] - off_[0]);
+    }
+
+    // Create the view tensor. We use ggml_new_tensor_3d to allocate the tensor
+    // metadata, then overwrite the data pointer and strides.
+    // The element type must match w's type so the kernel can interpret the data correctly.
+    struct ggml_tensor* view = ggml_new_tensor_3d(graph_ctx, w->type, ne0, ne1, n_slots);
+    if (view == nullptr) {
+        return slot_tensor_;
+    }
+
+    // Set the data pointer to the slot arena
+    view->data = slot_tensor_->data;
+
+    // Set the strides to match w's layout, but with n_slots instead of n_expert
+    view->nb[0] = w->nb[0];
+    view->nb[1] = w->nb[1];
+    view->nb[2] = slot_bytes;
+    view->nb[3] = slot_bytes * n_slots;
+
+    // Mark as a view so ggml doesn't try to free the data
+    view->op = GGML_OP_VIEW;
+    view->view_src = slot_tensor_;
+
+    return view;
 }
 
 bool llama_read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,

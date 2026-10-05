@@ -1994,26 +1994,165 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 // For each selected expert, checks the residency table. If resident, uses cached weights;
 // otherwise uses original weights.
 //
-// This is a simplified implementation that falls back to the original weights
-// if the cache is not populated or if the expert is not resident.
+// Implementation: Uses the same host-side sorting approach as ggml_cuda_mul_mat_id,
+// but for each expert, checks the residency table and selects the appropriate
+// weights (cached or original) before performing the matmul.
 static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0   = dst->src[0]; // original expert weights
-    const ggml_tensor * src1   = dst->src[1]; // input
-    const ggml_tensor * ids    = dst->src[2]; // selected expert IDs
-    const ggml_tensor * cached = dst->src[3]; // cached expert weights
-    const ggml_tensor * residency = dst->src[4]; // residency table
+    const ggml_tensor * src0      = dst->src[0]; // original expert weights [n_ff, n_embd, n_expert]
+    const ggml_tensor * src1      = dst->src[1]; // input [n_embd, 1, n_tokens]
+    const ggml_tensor * ids       = dst->src[2]; // selected expert IDs [n_expert_used, n_tokens]
+    const ggml_tensor * cached    = dst->src[3]; // cached expert weights [n_ff, n_embd, n_slots]
+    const ggml_tensor * residency = dst->src[4]; // residency table [n_expert] (I32, slot or -1)
 
-    // For now, fall back to the original mul_mat_id operation.
-    // A full implementation would check the residency table for each expert
-    // and use the cached weights if resident.
-    //
-    // TODO: Implement the full hit/miss split kernel.
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(residency->type == GGML_TYPE_I32);
 
-    // Create a temporary tensor that wraps the original mul_mat_id operation
-    ggml_tensor tmp = *dst;
-    tmp.op = GGML_OP_MUL_MAT_ID;
+    GGML_TENSOR_BINARY_OP_LOCALS
 
-    ggml_cuda_mul_mat_id(ctx, &tmp);
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    cudaStream_t stream = ctx.stream();
+
+    // Copy the residency table from device to host (it's small: n_expert int32 values)
+    std::vector<int32_t> residency_host(ne02);
+    CUDA_CHECK(cudaMemcpyAsync(residency_host.data(), residency->data, ne02 * sizeof(int32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Copy the IDs from device to host (needed for sorting)
+    std::vector<char> ids_host(ggml_nbytes(ids));
+    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t ne_get_rows = ne12 * n_expert_used;
+
+    // Sort rows by expert (same as ggml_cuda_mul_mat_id)
+    std::vector<int32_t> ids_to_sorted_host;
+    ids_to_sorted_host.reserve(2 * ne_get_rows);
+    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
+    std::vector<int32_t> tokens_per_expert(ne02, 0);
+
+    for (int64_t i02 = 0; i02 < ne02; ++i02) {
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
+            for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+                const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12 * ids->nb[1] + iex * ids->nb[0]);
+                GGML_ASSERT(expert_to_use >= 0 && expert_to_use < ne02);
+                if (expert_to_use == i02) {
+                    ids_from_sorted_host[i12 * n_expert_used + iex] = (int32_t)ids_to_sorted_host.size();
+                    ids_to_sorted_host.push_back((int32_t)(i12 * ne11 + iex % ne11));
+                    tokens_per_expert[i02]++;
+                    break;
+                }
+            }
+        }
+    }
+    GGML_ASSERT(ids_to_sorted_host.size() == (size_t)ne_get_rows);
+
+    ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
+
+    ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2 * ne_get_rows);
+    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(),
+                               2 * ne_get_rows * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0 * ne_get_rows;
+    const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1 * ne_get_rows;
+
+    // Allocate sorted input and output buffers
+    const ggml_type type_src1_sorted = (src0->type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc))
+        || ggml_is_quantized(src0->type) ? GGML_TYPE_F32 : src0->type;
+    const ggml_type type_dst_sorted  = GGML_TYPE_F32;
+    const size_t ts_src1_sorted = ggml_type_size(type_src1_sorted);
+    const size_t ts_dst_sorted  = ggml_type_size(type_dst_sorted);
+
+    ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12 * n_expert_used * ne10 * ts_src1_sorted);
+    ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 * n_expert_used * ne0 * ts_dst_sorted);
+
+    // Gather input rows for each expert
+    get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
+        ne10, nb11, nb12, nb13,
+        ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows * sizeof(int32_t), ne_get_rows * sizeof(int32_t),
+        ne10 * ts_src1_sorted, ne_get_rows * ne10 * ts_src1_sorted, ne_get_rows * ne10 * ts_src1_sorted, stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    // For each expert, perform the matmul with either cached or original weights
+    char * src1_data_cur = src1_sorted.ptr;
+    char *  dst_data_cur =  dst_sorted.ptr;
+
+    for (int64_t i02 = 0; i02 < ne02; ++i02) {
+        if (tokens_per_expert[i02] == 0) {
+            continue;
+        }
+
+        // Check if this expert is resident in the cache
+        const int32_t slot = residency_host[i02];
+        const bool resident = (slot >= 0);
+
+        // Select the appropriate weights tensor
+        const ggml_tensor * weights_src = src0;
+        int64_t weights_idx = i02;
+        size_t weights_nb2 = nb02;
+
+        if (resident) {
+            weights_src = cached;
+            weights_idx = slot;
+            weights_nb2 = cached->nb[2];
+        }
+
+        // Create a slice of the weights for this expert/slot
+        ggml_tensor src0_slice = *weights_src;
+        src0_slice.ne[2]    = 1;
+        src0_slice.nb[3]    = src0_slice.nb[2];
+        src0_slice.op       = GGML_OP_VIEW;
+        src0_slice.view_src = const_cast<ggml_tensor *>(weights_src);
+        src0_slice.data     = (char *) weights_src->data + weights_idx * weights_nb2;
+
+        // Create input slice for this expert
+        ggml_tensor src1_slice;
+        memset(&src1_slice, 0, sizeof(src1_slice));
+        src1_slice.buffer = src1->buffer;
+        src1_slice.type   = type_src1_sorted;
+        src1_slice.ne[0]  = ne10;
+        src1_slice.ne[1]  = tokens_per_expert[i02];
+        src1_slice.ne[2]  = 1;
+        src1_slice.ne[3]  = 1;
+        src1_slice.nb[0]  = ts_src1_sorted;
+        src1_slice.nb[1]  = src1_slice.ne[0] * src1_slice.nb[0];
+        src1_slice.nb[2]  = src1_slice.ne[1] * src1_slice.nb[1];
+        src1_slice.nb[3]  = src1_slice.ne[2] * src1_slice.nb[2];
+        src1_slice.data   = src1_data_cur;
+
+        // Create output slice for this expert
+        ggml_tensor dst_slice;
+        memset(&dst_slice, 0, sizeof(dst_slice));
+        memcpy(dst_slice.op_params, dst->op_params, sizeof(dst_slice.op_params));
+        dst_slice.buffer = dst->buffer;
+        dst_slice.type   = type_dst_sorted;
+        dst_slice.ne[0]  = ne0;
+        dst_slice.ne[1]  = tokens_per_expert[i02];
+        dst_slice.ne[2]  = 1;
+        dst_slice.ne[3]  = 1;
+        dst_slice.nb[0]  = ts_dst_sorted;
+        dst_slice.nb[1]  = dst_slice.ne[0] * dst_slice.nb[0];
+        dst_slice.nb[2]  = dst_slice.ne[1] * dst_slice.nb[1];
+        dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
+        dst_slice.data   = dst_data_cur;
+
+        // Perform the matmul
+        ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
+        CUDA_CHECK(cudaGetLastError());
+
+        src1_data_cur += src1_slice.nb[2];
+        dst_data_cur  +=  dst_slice.nb[2];
+    }
+
+    // Scatter results back to original positions
+    get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
+        ne0, ne0 * ts_dst_sorted, ne_get_rows * ne0 * ts_dst_sorted, ne_get_rows * ne0 * ts_dst_sorted,
+        ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows * sizeof(int32_t), ne_get_rows * sizeof(int32_t),
+        nb1, nb2, nb3, stream);
 }
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
