@@ -1022,6 +1022,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
+    "MUL_MAT_ID_CACHED",
     "OUT_PROD",
 
     "SCALE",
@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1137,6 +1138,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "X[i]*Y",
+    "X[i]*Y (cached)",
     "X*Y",
 
     "x*v",
@@ -1216,7 +1218,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3420,6 +3422,37 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_id_cached(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * cached,
+        struct ggml_tensor  * residency) {
+    GGML_ASSERT(!ggml_is_transposed(as));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(residency->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(as->ne[3] == 1); // as is 3d (one matrix per expert)
+    GGML_ASSERT(b->ne[3] == 1); // b is 3d
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
+    GGML_ASSERT(ids->ne[1] == b->ne[2]); // must have an expert list per b row
+    GGML_ASSERT(as->ne[0] == b->ne[0]); // can_mul_mat
+    GGML_ASSERT(ids->ne[0] % b->ne[1] == 0); // can broadcast
+
+    const int64_t ne[4] = { as->ne[1], ids->ne[0], b->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT_ID_CACHED;
+    result->src[0] = as;
+    result->src[1] = b;
+    result->src[2] = ids;
+    result->src[3] = cached;
+    result->src[4] = residency;
 
     return result;
 }

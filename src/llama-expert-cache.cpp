@@ -12,6 +12,68 @@ llama_expert_cache::~llama_expert_cache() {
     close();
 }
 
+llama_expert_cache::llama_expert_cache(llama_expert_cache&& other) noexcept {
+    slot_tensor_ = other.slot_tensor_;
+    residency_tensor_ = other.residency_tensor_;
+    base_ = other.base_;
+    residency_ = std::move(other.residency_);
+    slots_ = other.slots_;
+    n_layers_ = other.n_layers_;
+    n_expert_ = other.n_expert_;
+    blob_ = other.blob_;
+    next_free_ = other.next_free_;
+    fills_ = other.fills_;
+    per_layer_ = other.per_layer_;
+    layer_next_ = std::move(other.layer_next_);
+    off_ = std::move(other.off_);
+    admitted_ = other.admitted_;
+
+    other.slot_tensor_ = nullptr;
+    other.residency_tensor_ = nullptr;
+    other.base_ = nullptr;
+    other.slots_ = 0;
+    other.n_layers_ = 0;
+    other.n_expert_ = 0;
+    other.blob_ = 0;
+    other.next_free_ = 0;
+    other.fills_ = 0;
+    other.per_layer_ = false;
+    other.admitted_ = 0;
+}
+
+llama_expert_cache& llama_expert_cache::operator=(llama_expert_cache&& other) noexcept {
+    if (this != &other) {
+        close();
+        slot_tensor_ = other.slot_tensor_;
+        residency_tensor_ = other.residency_tensor_;
+        base_ = other.base_;
+        residency_ = std::move(other.residency_);
+        slots_ = other.slots_;
+        n_layers_ = other.n_layers_;
+        n_expert_ = other.n_expert_;
+        blob_ = other.blob_;
+        next_free_ = other.next_free_;
+        fills_ = other.fills_;
+        per_layer_ = other.per_layer_;
+        layer_next_ = std::move(other.layer_next_);
+        off_ = std::move(other.off_);
+        admitted_ = other.admitted_;
+
+        other.slot_tensor_ = nullptr;
+        other.residency_tensor_ = nullptr;
+        other.base_ = nullptr;
+        other.slots_ = 0;
+        other.n_layers_ = 0;
+        other.n_expert_ = 0;
+        other.blob_ = 0;
+        other.next_free_ = 0;
+        other.fills_ = 0;
+        other.per_layer_ = false;
+        other.admitted_ = 0;
+    }
+    return *this;
+}
+
 bool llama_expert_cache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
                               struct ggml_context* ctx, std::string& err) {
     close();
@@ -63,6 +125,11 @@ bool llama_expert_cache::open(int64_t n_slots, int64_t n_layers, int64_t n_exper
         layer_next_[(size_t)l] = (int32_t)lo;
     }
 
+    // Create a GGML tensor that wraps the residency table
+    // This is a view tensor that points to the residency_ vector data
+    residency_tensor_ = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_layers * n_expert);
+    residency_tensor_->data = residency_.data();
+
     return true;
 }
 
@@ -95,6 +162,7 @@ bool llama_expert_cache::open_sized(const std::vector<int64_t>& slot_bytes, int6
 
 void llama_expert_cache::close() {
     slot_tensor_ = nullptr;
+    residency_tensor_ = nullptr;
     base_ = nullptr;
     off_.clear();
     residency_.clear();

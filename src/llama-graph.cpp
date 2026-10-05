@@ -1524,6 +1524,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     prec_policy      (params.prec_policy),
+    expert_cache     (params.expert_cache),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1590,7 +1591,15 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * res;
+    if (expert_cache && expert_cache->valid()) {
+        // Use the cached MoE operation
+        res = ggml_mul_mat_id_cached(ctx0, w, cur, ids,
+                                     expert_cache->slot_tensor(),
+                                     expert_cache->residency_table_tensor());
+    } else {
+        res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);

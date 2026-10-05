@@ -523,6 +523,7 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
+        GGML_OP_MUL_MAT_ID_CACHED,
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -1502,6 +1503,20 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // indirect matrix multiplication with expert cache
+    // as: original expert weights [n_ff, n_embd, n_expert]
+    // b: input [n_embd, 1, n_tokens]
+    // ids: selected expert IDs [n_expert_used, n_tokens]
+    // cached: cached expert weights [n_ff, n_embd, n_slots]
+    // residency: residency table [n_expert] (I32, slot index or -1)
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_cached(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * cached,
+            struct ggml_tensor  * residency);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

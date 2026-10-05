@@ -20,6 +20,7 @@ struct ggml_tensor;
 struct llama_cparams;
 struct llama_layer;
 struct llama_prec_policy;
+class llama_expert_cache;
 
 struct llama_memory_context_i;
 
@@ -796,6 +797,9 @@ struct llm_graph_params {
 
     const llama_prec_policy * prec_policy = nullptr;
 
+    // adaptive VRAM expert tier (Strata R4)
+    const llama_expert_cache * expert_cache = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -1038,6 +1042,9 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     const llama_prec_policy * prec_policy;
+
+    // adaptive VRAM expert tier (Strata R4)
+    const llama_expert_cache * expert_cache;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

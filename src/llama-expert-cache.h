@@ -35,6 +35,9 @@ public:
     llama_expert_cache(const llama_expert_cache&) = delete;
     llama_expert_cache& operator=(const llama_expert_cache&) = delete;
 
+    llama_expert_cache(llama_expert_cache&& other) noexcept;
+    llama_expert_cache& operator=(llama_expert_cache&& other) noexcept;
+
     // Open the cache with uniform slot sizes
     // n_slots: total number of expert slots
     // n_layers: number of MoE layers
@@ -81,6 +84,10 @@ public:
     // Access residency table directly (for kernel use)
     const int32_t* residency_table() const { return residency_.data(); }
 
+    // Get the residency table as a GGML tensor (for kernel access)
+    // Creates a view tensor that wraps the residency table data
+    struct ggml_tensor* residency_table_tensor() const { return residency_tensor_; }
+
     // Get the slot tensor (for kernel access)
     struct ggml_tensor* slot_tensor() const { return slot_tensor_; }
 
@@ -90,6 +97,7 @@ public:
 
 private:
     struct ggml_tensor* slot_tensor_ = nullptr;
+    struct ggml_tensor* residency_tensor_ = nullptr;
     void* base_ = nullptr;
     std::vector<int32_t> residency_;   // [n_layers * n_expert] -> slot or LLAMA_EXPERT_NOT_RESIDENT
     int64_t slots_ = 0;

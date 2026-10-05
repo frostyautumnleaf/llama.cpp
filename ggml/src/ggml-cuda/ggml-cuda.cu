@@ -1989,6 +1989,33 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+// ggml_cuda_mul_mat_id_cached
+// Indirect matrix multiplication with expert cache.
+// For each selected expert, checks the residency table. If resident, uses cached weights;
+// otherwise uses original weights.
+//
+// This is a simplified implementation that falls back to the original weights
+// if the cache is not populated or if the expert is not resident.
+static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0   = dst->src[0]; // original expert weights
+    const ggml_tensor * src1   = dst->src[1]; // input
+    const ggml_tensor * ids    = dst->src[2]; // selected expert IDs
+    const ggml_tensor * cached = dst->src[3]; // cached expert weights
+    const ggml_tensor * residency = dst->src[4]; // residency table
+
+    // For now, fall back to the original mul_mat_id operation.
+    // A full implementation would check the residency table for each expert
+    // and use the cached weights if resident.
+    //
+    // TODO: Implement the full hit/miss split kernel.
+
+    // Create a temporary tensor that wraps the original mul_mat_id operation
+    ggml_tensor tmp = *dst;
+    tmp.op = GGML_OP_MUL_MAT_ID;
+
+    ggml_cuda_mul_mat_id(ctx, &tmp);
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2344,6 +2371,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_MUL_MAT_ID_CACHED:
+            ggml_cuda_mul_mat_id_cached(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);

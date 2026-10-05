@@ -1282,50 +1282,82 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // with the full llama library (not just the public API)
     if (params.expert_cache_slots > 0) {
         // Access the internal model structure to get expert information
-        const auto * model_int = reinterpret_cast<const llama_model *>(model);
+        llama_model * model_int = reinterpret_cast<llama_model *>(model);
         const auto & hparams = model_int->hparams;
 
         if (hparams.n_expert > 0) {
             // Calculate expert blob size from the first expert tensor
-            // For now, use a conservative estimate based on model type
-            // In a real implementation, this would read the actual tensor size
-            const int64_t n_ff_exp = hparams.n_ff_exp(0);
-            const int64_t n_embd = hparams.n_embd;
-            // Estimate: one expert's gate+up+down weights (in Q4_K_XL, this is roughly n_ff_exp * n_embd / 2 bytes per weight matrix)
-            const int64_t blob_bytes = 3 * n_ff_exp * n_embd / 2; // approximate for Q4_K_XL
-
-            std::string err;
-            llama_expert_cache cache;
-            if (cache.open(params.expert_cache_slots, hparams.n_layer(), hparams.n_expert,
-                           blob_bytes, nullptr, err)) {
-                cache.set_per_layer_admission(true);
-
-                // Load profile if specified
-                if (!params.expert_profile.empty()) {
-                    std::vector<std::pair<int32_t, int32_t>> ranked;
-                    int64_t slots = 0;
-                    if (llama_read_expert_profile(params.expert_profile, hparams.n_layer(),
-                                                  hparams.n_expert, ranked, slots, err)) {
-                        // Admit experts from the profile in ranked order
-                        for (const auto & [layer, expert] : ranked) {
-                            if (cache.admit(layer, expert) == LLAMA_EXPERT_NOT_RESIDENT) {
-                                break; // cache is full
-                            }
-                        }
-                        LOG_INF("expert cache: loaded profile with %zu ranked pairs, %lld resident\n",
-                                ranked.size(), (long long)cache.resident());
-                    } else {
-                        LOG_WRN("expert cache: failed to load profile: %s\n", err.c_str());
-                    }
-                }
-
-                // Store the cache in the model
-                // Note: this requires modifying the llama_model structure to hold the cache
-                // For now, we just log that it's initialized
-                LOG_INF("expert cache: initialized with %d slots, %lld resident\n",
-                        params.expert_cache_slots, (long long)cache.resident());
+            // Use the actual tensor size from the model's expert weights
+            const ggml_tensor * first_expert_tensor = model_int->get_tensor("blk.0.ffn_gate_exps");
+            if (first_expert_tensor == nullptr) {
+                first_expert_tensor = model_int->get_tensor("blk.0.ffn_up_exps");
+            }
+            int64_t blob_bytes = 0;
+            if (first_expert_tensor != nullptr) {
+                // Each expert's weights are a slice of the 3D tensor [n_ff, n_embd, n_expert]
+                // The size of one expert's weights is the total size divided by n_expert
+                blob_bytes = ggml_nbytes(first_expert_tensor) / hparams.n_expert;
+                LOG_INF("expert cache: expert blob size = %lld bytes (from %s)\n",
+                        (long long)blob_bytes, first_expert_tensor->name);
             } else {
-                LOG_WRN("expert cache: failed to initialize: %s\n", err.c_str());
+                // Fallback: estimate based on model type
+                const int64_t n_ff_exp = hparams.n_ff_exp(0);
+                const int64_t n_embd = hparams.n_embd;
+                blob_bytes = 3 * n_ff_exp * n_embd / 2; // approximate for Q4_K_XL
+                LOG_WRN("expert cache: could not find expert tensor, using estimated blob size %lld bytes\n",
+                        (long long)blob_bytes);
+            }
+
+            // Get the GPU device for the first MoE layer
+            ggml_backend_dev_t dev = model_int->dev_layer(0);
+            if (dev == nullptr) {
+                LOG_WRN("expert cache: no device for layer 0, using CPU\n");
+            }
+
+            // Create a ggml context for the expert cache
+            ggml_init_params ctx_params = {
+                /*.mem_size   =*/ 16 * 1024 * 1024, // 16 MB for tensor metadata
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ false,
+            };
+            ggml_context * cache_ctx = ggml_init(ctx_params);
+            if (cache_ctx == nullptr) {
+                LOG_WRN("expert cache: failed to create ggml context\n");
+            } else {
+                std::string err;
+                llama_expert_cache cache;
+                if (cache.open(params.expert_cache_slots, hparams.n_layer(), hparams.n_expert,
+                               blob_bytes, cache_ctx, err)) {
+                    cache.set_per_layer_admission(true);
+
+                    // Load profile if specified
+                    if (!params.expert_profile.empty()) {
+                        std::vector<std::pair<int32_t, int32_t>> ranked;
+                        int64_t slots = 0;
+                        if (llama_read_expert_profile(params.expert_profile, hparams.n_layer(),
+                                                      hparams.n_expert, ranked, slots, err)) {
+                            // Admit experts from the profile in ranked order
+                            for (const auto & [layer, expert] : ranked) {
+                                if (cache.admit(layer, expert) == LLAMA_EXPERT_NOT_RESIDENT) {
+                                    break; // cache is full
+                                }
+                            }
+                            LOG_INF("expert cache: loaded profile with %zu ranked pairs, %lld resident\n",
+                                    ranked.size(), (long long)cache.resident());
+                        } else {
+                            LOG_WRN("expert cache: failed to load profile: %s\n", err.c_str());
+                        }
+                    }
+
+                    // Store the cache in the model
+                    model_int->expert_cache = std::make_unique<llama_expert_cache>(std::move(cache));
+                    LOG_INF("expert cache: initialized with %d slots, %lld resident, %lld bytes total\n",
+                            params.expert_cache_slots, (long long)model_int->expert_cache->resident(),
+                            (long long)model_int->expert_cache->bytes());
+                } else {
+                    LOG_WRN("expert cache: failed to initialize: %s\n", err.c_str());
+                    ggml_free(cache_ctx);
+                }
             }
         } else {
             LOG_WRN("expert cache: model has no experts, ignoring\n");
