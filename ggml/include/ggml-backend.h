@@ -447,6 +447,11 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
+    // Expert cache multi-tier support (CUDA)
+    // Set the tier 1 (secondary GPU) slot tensor for the cached MoE kernel.
+    // Must be called before graph execution. Pass nullptr to disable tier 1.
+    GGML_API void ggml_cuda_set_expert_cache_tier1_slot_tensor(const struct ggml_tensor * tensor);
+
 #ifdef  __cplusplus
 }
 #endif

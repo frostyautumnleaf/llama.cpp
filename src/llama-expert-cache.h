@@ -3,6 +3,13 @@
 // Implements Strata's R4 design: a pool of VRAM slots that hold the most-frequently
 // routed experts, with a residency table mapping (layer, expert) -> slot or -1.
 //
+// Multi-GPU tiers (Strata's "second GPU as another expert tier"):
+//   - Tier 0: main GPU (always present when cache is enabled)
+//   - Tier 1: second GPU (optional, holds warm experts not in tier 0)
+//   - Tier 2: third GPU (optional, holds cool experts not in tier 0 or 1)
+//   - Each tier has its own slot arena and residency table
+//   - The kernel checks tiers in order; first hit wins
+//
 // Key design decisions (from Strata measurements):
 //   - Per-layer slot ranges are MANDATORY: a shared pool starves all but the first few
 //     layers (2.97% hit rate for shared pool vs 21.4% for 8 slots/layer)
@@ -22,34 +29,29 @@
 #include <memory>
 
 struct ggml_tensor;
+struct ggml_backend_dev;
 
 // Slot index or -1 if not resident
 static constexpr int32_t LLAMA_EXPERT_NOT_RESIDENT = -1;
 
-// Expert cache: slot storage and residency table
-class llama_expert_cache {
+// Maximum number of expert cache tiers (GPUs)
+static constexpr int LLAMA_EXPERT_MAX_TIERS = 3;
+
+// A single expert cache tier (one GPU)
+class llama_expert_cache_tier {
 public:
-    llama_expert_cache() = default;
-    ~llama_expert_cache();
+    llama_expert_cache_tier() = default;
+    ~llama_expert_cache_tier();
 
-    llama_expert_cache(const llama_expert_cache&) = delete;
-    llama_expert_cache& operator=(const llama_expert_cache&) = delete;
+    llama_expert_cache_tier(const llama_expert_cache_tier&) = delete;
+    llama_expert_cache_tier& operator=(const llama_expert_cache_tier&) = delete;
 
-    llama_expert_cache(llama_expert_cache&& other) noexcept;
-    llama_expert_cache& operator=(llama_expert_cache&& other) noexcept;
+    llama_expert_cache_tier(llama_expert_cache_tier&& other) noexcept;
+    llama_expert_cache_tier& operator=(llama_expert_cache_tier&& other) noexcept;
 
-    // Open the cache with uniform slot sizes
-    // n_slots: total number of expert slots
-    // n_layers: number of MoE layers
-    // n_expert: experts per layer
-    // blob_bytes: size of each expert's weights in bytes
-    // ctx: ggml context for allocation (must outlive the cache)
+    // Open the tier with uniform slot sizes
     bool open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
               struct ggml_context* ctx, std::string& err);
-
-    // Open the cache with per-slot sizes (for native packs where experts differ in size)
-    bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert,
-                    struct ggml_context* ctx, std::string& err);
 
     void close();
 
@@ -62,41 +64,28 @@ public:
     int32_t slot_of(int64_t layer, int64_t expert) const;
 
     // Claim the next free slot for (layer, expert)
-    // Returns the slot index, or LLAMA_EXPERT_NOT_RESIDENT if full
     int32_t admit(int64_t layer, int64_t expert);
 
-    // Per-layer admission: layer l uses slots [l*q, (l+1)*q) where q = slots/n_layers
     void set_per_layer_admission(bool on) { per_layer_ = on; }
     bool per_layer_admission() const { return per_layer_; }
     void layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const;
 
-    // Get device pointer for a slot
     void* device_slot(int32_t slot);
     const void* device_slot(int32_t slot) const;
 
-    // Copy expert weights from source tensor into a slot (blocking)
-    // src: pointer to the expert's weights in the original tensor
     bool fill_slot_blocking(int32_t slot, const void* src, std::string& err, int64_t bytes = 0);
 
-    // Number of slots filled so far
     int64_t fills() const { return fills_; }
 
-    // Access residency table directly (for kernel use)
     const int32_t* residency_table() const { return residency_.data(); }
-
-    // Get the residency table as a GGML tensor (for kernel access)
-    // Creates a view tensor that wraps the residency table data
     struct ggml_tensor* residency_table_tensor() const { return residency_tensor_; }
 
     // Get the slot tensor (for kernel access)
-    // If w is provided, returns a properly-shaped view of the slot arena matching w's layout
-    // with ne[2] = n_slots. The view tensor is allocated in the given context.
-    // If w is null, returns the raw 1D byte buffer (legacy).
     struct ggml_tensor* slot_tensor(struct ggml_context* graph_ctx, const ggml_tensor* w = nullptr) const;
 
-    // Number of layers and experts (for kernel use)
     int64_t n_layers() const { return n_layers_; }
     int64_t n_expert() const { return n_expert_; }
+    int64_t blob_bytes() const { return blob_; }
 
 private:
     struct ggml_context* ctx_ = nullptr;
@@ -114,6 +103,81 @@ private:
     std::vector<int32_t> layer_next_;  // [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;        // slot offsets when sized
     int64_t admitted_ = 0;
+};
+
+// Expert cache: multi-tier slot storage and residency tables
+class llama_expert_cache {
+public:
+    llama_expert_cache() = default;
+    ~llama_expert_cache();
+
+    llama_expert_cache(const llama_expert_cache&) = delete;
+    llama_expert_cache& operator=(const llama_expert_cache&) = delete;
+
+    llama_expert_cache(llama_expert_cache&& other) noexcept;
+    llama_expert_cache& operator=(llama_expert_cache&& other) noexcept;
+
+    // Open tier 0 (main GPU). Must be called before any other tier.
+    bool open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
+              struct ggml_context* ctx, std::string& err);
+
+    // Open an additional tier on a different GPU. Returns the tier index (1 or 2).
+    // device_idx: CUDA device index for this tier's GPU
+    int open_tier(int64_t n_slots, struct ggml_context* ctx, int device_idx, std::string& err);
+
+    void close();
+
+    bool valid() const { return tiers_[0].valid(); }
+    int num_tiers() const { return num_tiers_; }
+    int64_t slots(int tier = 0) const { return tier < num_tiers_ ? tiers_[tier].slots() : 0; }
+    int64_t resident(int tier = 0) const { return tier < num_tiers_ ? tiers_[tier].resident() : 0; }
+    int64_t total_resident() const;
+    int64_t bytes(int tier = 0) const { return tier < num_tiers_ ? tiers_[tier].bytes() : 0; }
+
+    // (layer, expert) -> (tier, slot) or (-1, LLAMA_EXPERT_NOT_RESIDENT)
+    // Searches tiers in order; first hit wins
+    void slot_of(int64_t layer, int64_t expert, int& tier, int32_t& slot) const;
+
+    // Claim a slot for (layer, expert), trying tiers in order
+    // Returns the tier index, or -1 if all full
+    int admit(int64_t layer, int64_t expert);
+
+    void set_per_layer_admission(bool on);
+    bool per_layer_admission() const { return tiers_[0].per_layer_admission(); }
+
+    void* device_slot(int tier, int32_t slot);
+    const void* device_slot(int tier, int32_t slot) const;
+
+    bool fill_slot_blocking(int tier, int32_t slot, const void* src, std::string& err, int64_t bytes = 0);
+
+    int64_t fills(int tier = 0) const { return tier < num_tiers_ ? tiers_[tier].fills() : 0; }
+
+    // Access tier's residency table directly
+    const int32_t* residency_table(int tier) const { return tier < num_tiers_ ? tiers_[tier].residency_table() : nullptr; }
+
+    // Get tier's residency table as a GGML tensor
+    struct ggml_tensor* residency_table_tensor(int tier) const { return tier < num_tiers_ ? tiers_[tier].residency_table_tensor() : nullptr; }
+
+    // Combined residency table encoding (tier, slot) for multi-tier kernel:
+    //   value >= 0: tier 0, slot = value
+    //   value <  0: tier 1, slot = -value - 1
+    // Must be called after all tiers are populated. Creates a combined table
+    // in the given ggml context.
+    struct ggml_tensor* combined_residency_table(struct ggml_context* ctx) const;
+
+    // Get tier's slot tensor
+    struct ggml_tensor* slot_tensor(int tier, struct ggml_context* graph_ctx, const ggml_tensor* w = nullptr) const;
+
+    int64_t n_layers() const { return tiers_[0].n_layers(); }
+    int64_t n_expert() const { return tiers_[0].n_expert(); }
+    int64_t blob_bytes() const { return tiers_[0].blob_bytes(); }
+
+    // Tier access for kernel use
+    const llama_expert_cache_tier& tier(int i) const { return tiers_[i]; }
+
+private:
+    llama_expert_cache_tier tiers_[LLAMA_EXPERT_MAX_TIERS];
+    int num_tiers_ = 0;
 };
 
 // Read an expert profile from a file (Strata's STRP format)

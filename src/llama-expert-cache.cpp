@@ -1,4 +1,5 @@
 // llama-expert-cache.cpp - Adaptive VRAM expert tier implementation
+// Multi-GPU support: each tier is a separate expert cache on a different GPU
 #include "llama-expert-cache.h"
 
 #include "ggml.h"
@@ -8,11 +9,16 @@
 #include <cstring>
 #include <algorithm>
 
-llama_expert_cache::~llama_expert_cache() {
+// ============================================================================
+// llama_expert_cache_tier: single-GPU expert cache
+// ============================================================================
+
+llama_expert_cache_tier::~llama_expert_cache_tier() {
     close();
 }
 
-llama_expert_cache::llama_expert_cache(llama_expert_cache&& other) noexcept {
+llama_expert_cache_tier::llama_expert_cache_tier(llama_expert_cache_tier&& other) noexcept {
+    ctx_ = other.ctx_;
     slot_tensor_ = other.slot_tensor_;
     residency_tensor_ = other.residency_tensor_;
     base_ = other.base_;
@@ -28,6 +34,7 @@ llama_expert_cache::llama_expert_cache(llama_expert_cache&& other) noexcept {
     off_ = std::move(other.off_);
     admitted_ = other.admitted_;
 
+    other.ctx_ = nullptr;
     other.slot_tensor_ = nullptr;
     other.residency_tensor_ = nullptr;
     other.base_ = nullptr;
@@ -41,9 +48,10 @@ llama_expert_cache::llama_expert_cache(llama_expert_cache&& other) noexcept {
     other.admitted_ = 0;
 }
 
-llama_expert_cache& llama_expert_cache::operator=(llama_expert_cache&& other) noexcept {
+llama_expert_cache_tier& llama_expert_cache_tier::operator=(llama_expert_cache_tier&& other) noexcept {
     if (this != &other) {
         close();
+        ctx_ = other.ctx_;
         slot_tensor_ = other.slot_tensor_;
         residency_tensor_ = other.residency_tensor_;
         base_ = other.base_;
@@ -59,6 +67,7 @@ llama_expert_cache& llama_expert_cache::operator=(llama_expert_cache&& other) no
         off_ = std::move(other.off_);
         admitted_ = other.admitted_;
 
+        other.ctx_ = nullptr;
         other.slot_tensor_ = nullptr;
         other.residency_tensor_ = nullptr;
         other.base_ = nullptr;
@@ -74,19 +83,19 @@ llama_expert_cache& llama_expert_cache::operator=(llama_expert_cache&& other) no
     return *this;
 }
 
-bool llama_expert_cache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
-                              struct ggml_context* ctx, std::string& err) {
+bool llama_expert_cache_tier::open(int64_t n_slots, int64_t n_layers, int64_t n_expert,
+                                   int64_t blob_bytes, struct ggml_context* ctx, std::string& err) {
     close();
     if (n_slots <= 0) {
-        err = "llama_expert_cache: n_slots must be positive";
+        err = "llama_expert_cache_tier: n_slots must be positive";
         return false;
     }
     if (n_layers <= 0 || n_expert <= 0 || blob_bytes <= 0) {
-        err = "llama_expert_cache: n_layers, n_expert and blob_bytes must all be positive";
+        err = "llama_expert_cache_tier: n_layers, n_expert and blob_bytes must all be positive";
         return false;
     }
     if (ctx == nullptr) {
-        err = "llama_expert_cache: ctx must not be null";
+        err = "llama_expert_cache_tier: ctx must not be null";
         return false;
     }
 
@@ -94,12 +103,11 @@ bool llama_expert_cache::open(int64_t n_slots, int64_t n_layers, int64_t n_exper
     const uint64_t want = (uint64_t)n_slots * (uint64_t)blob_bytes;
 
     // Allocate a single tensor for the entire slot arena
-    // This is a flat byte buffer that we'll partition into slots
     // Use I8 as a byte type (GGML_TYPE_U8 doesn't exist)
     slot_tensor_ = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t)want);
     if (slot_tensor_ == nullptr) {
         char buf[256];
-        snprintf(buf, sizeof(buf), "llama_expert_cache: failed to allocate %.2f GiB for expert cache",
+        snprintf(buf, sizeof(buf), "llama_expert_cache_tier: failed to allocate %.2f GiB for expert cache tier",
                  (double)want / 1073741824.0);
         err = buf;
         return false;
@@ -127,41 +135,13 @@ bool llama_expert_cache::open(int64_t n_slots, int64_t n_layers, int64_t n_exper
     }
 
     // Create a GGML tensor that wraps the residency table
-    // This is a view tensor that points to the residency_ vector data
     residency_tensor_ = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_layers * n_expert);
     residency_tensor_->data = residency_.data();
 
     return true;
 }
 
-bool llama_expert_cache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers,
-                                    int64_t n_expert, struct ggml_context* ctx, std::string& err) {
-    if (slot_bytes.empty()) {
-        err = "llama_expert_cache: no slots";
-        return false;
-    }
-
-    int64_t mx = 0;
-    std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
-    for (size_t i = 0; i < slot_bytes.size(); ++i) {
-        // 256-byte aligned slots
-        off[i + 1] = off[i] + ((uint64_t)slot_bytes[i] + 255) / 256 * 256;
-        mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
-    }
-
-    if (!open((int64_t)off.back(), n_layers, n_expert, 1, ctx, err)) {
-        return false;
-    }
-
-    slots_ = (int64_t)slot_bytes.size();
-    blob_ = mx;
-    off_ = std::move(off);
-
-    layer_next_.assign((size_t)n_layers, 0);
-    return true;
-}
-
-void llama_expert_cache::close() {
+void llama_expert_cache_tier::close() {
     ctx_ = nullptr;
     slot_tensor_ = nullptr;
     residency_tensor_ = nullptr;
@@ -178,7 +158,7 @@ void llama_expert_cache::close() {
     layer_next_.clear();
 }
 
-void llama_expert_cache::layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const {
+void llama_expert_cache_tier::layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const {
     lo = 0;
     hi = 0;
     if (n_layers_ <= 0 || slots_ <= 0 || layer < 0 || layer >= n_layers_) {
@@ -189,14 +169,14 @@ void llama_expert_cache::layer_slot_range(int64_t layer, int64_t& lo, int64_t& h
     hi = (layer == n_layers_ - 1) ? slots_ : (layer + 1) * q;
 }
 
-int32_t llama_expert_cache::slot_of(int64_t layer, int64_t expert) const {
+int32_t llama_expert_cache_tier::slot_of(int64_t layer, int64_t expert) const {
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) {
         return LLAMA_EXPERT_NOT_RESIDENT;
     }
     return residency_[(size_t)(layer * n_expert_ + expert)];
 }
 
-int32_t llama_expert_cache::admit(int64_t layer, int64_t expert) {
+int32_t llama_expert_cache_tier::admit(int64_t layer, int64_t expert) {
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) {
         return LLAMA_EXPERT_NOT_RESIDENT;
     }
@@ -226,7 +206,7 @@ int32_t llama_expert_cache::admit(int64_t layer, int64_t expert) {
     return (int32_t)next_free_++;
 }
 
-void* llama_expert_cache::device_slot(int32_t slot) {
+void* llama_expert_cache_tier::device_slot(int32_t slot) {
     if (slot < 0 || slot >= slots_) {
         return nullptr;
     }
@@ -236,7 +216,7 @@ void* llama_expert_cache::device_slot(int32_t slot) {
     return (uint8_t*)base_ + (size_t)slot * (size_t)blob_;
 }
 
-const void* llama_expert_cache::device_slot(int32_t slot) const {
+const void* llama_expert_cache_tier::device_slot(int32_t slot) const {
     if (slot < 0 || slot >= slots_) {
         return nullptr;
     }
@@ -246,72 +226,222 @@ const void* llama_expert_cache::device_slot(int32_t slot) const {
     return (const uint8_t*)base_ + (size_t)slot * (size_t)blob_;
 }
 
-bool llama_expert_cache::fill_slot_blocking(int32_t slot, const void* src,
-                                            std::string& err, int64_t bytes) {
+bool llama_expert_cache_tier::fill_slot_blocking(int32_t slot, const void* src,
+                                                 std::string& err, int64_t bytes) {
     const size_t n = (size_t)(bytes > 0 && bytes <= blob_ ? bytes : blob_);
     void* dst = device_slot(slot);
     if (dst == nullptr) {
-        err = "llama_expert_cache::fill_slot_blocking: slot outside the arena";
+        err = "llama_expert_cache_tier::fill_slot_blocking: slot outside the arena";
         return false;
     }
     if (src == nullptr) {
-        err = "llama_expert_cache::fill_slot_blocking: source is null";
+        err = "llama_expert_cache_tier::fill_slot_blocking: source is null";
         return false;
     }
 
-    // In a real implementation, this would use cudaMemcpyAsync or similar
-    // For now, we use memcpy which works for both host and device memory
-    // when the backend supports it (e.g., unified memory)
     std::memcpy(dst, src, n);
     ++fills_;
     return true;
 }
 
-struct ggml_tensor* llama_expert_cache::slot_tensor(struct ggml_context* graph_ctx, const ggml_tensor* w) const {
+struct ggml_tensor* llama_expert_cache_tier::slot_tensor(struct ggml_context* graph_ctx,
+                                                         const ggml_tensor* w) const {
     if (w == nullptr) {
         return slot_tensor_;
     }
 
     // Create a properly-shaped view of the slot arena matching w's layout.
     // w has shape [ne0, ne1, n_expert] and we want [ne0, ne1, n_slots].
-    // The strides nb[0], nb[1] are copied from w; nb[2] is the size of one slot.
-    //
-    // The view tensor is allocated in the graph context so it has the same
-    // lifetime as the rest of the graph.
-
     const int64_t ne0 = w->ne[0];
     const int64_t ne1 = w->ne[1];
     const int64_t n_slots = slots_;
 
-    // The size of one slot in bytes is blob_ (for uniform slots)
-    // or off_[1] - off_[0] (for sized slots).
     int64_t slot_bytes = blob_;
     if (!off_.empty()) {
         slot_bytes = (int64_t)(off_[1] - off_[0]);
     }
 
-    // Create the view tensor. We use ggml_new_tensor_3d to allocate the tensor
-    // metadata, then overwrite the data pointer and strides.
-    // The element type must match w's type so the kernel can interpret the data correctly.
     struct ggml_tensor* view = ggml_new_tensor_3d(graph_ctx, w->type, ne0, ne1, n_slots);
     if (view == nullptr) {
         return slot_tensor_;
     }
 
-    // Set the data pointer to the slot arena
     view->data = slot_tensor_->data;
-
-    // Set the strides to match w's layout, but with n_slots instead of n_expert
     view->nb[0] = w->nb[0];
     view->nb[1] = w->nb[1];
     view->nb[2] = slot_bytes;
     view->nb[3] = slot_bytes * n_slots;
-
-    // Mark as a view so ggml doesn't try to free the data
     view->op = GGML_OP_VIEW;
     view->view_src = slot_tensor_;
 
     return view;
+}
+
+// ============================================================================
+// llama_expert_cache: multi-tier manager
+// ============================================================================
+
+llama_expert_cache::~llama_expert_cache() {
+    close();
+}
+
+llama_expert_cache::llama_expert_cache(llama_expert_cache&& other) noexcept {
+    for (int i = 0; i < LLAMA_EXPERT_MAX_TIERS; ++i) {
+        tiers_[i] = std::move(other.tiers_[i]);
+    }
+    num_tiers_ = other.num_tiers_;
+    other.num_tiers_ = 0;
+}
+
+llama_expert_cache& llama_expert_cache::operator=(llama_expert_cache&& other) noexcept {
+    if (this != &other) {
+        close();
+        for (int i = 0; i < LLAMA_EXPERT_MAX_TIERS; ++i) {
+            tiers_[i] = std::move(other.tiers_[i]);
+        }
+        num_tiers_ = other.num_tiers_;
+        other.num_tiers_ = 0;
+    }
+    return *this;
+}
+
+bool llama_expert_cache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert,
+                              int64_t blob_bytes, struct ggml_context* ctx, std::string& err) {
+    close();
+    if (!tiers_[0].open(n_slots, n_layers, n_expert, blob_bytes, ctx, err)) {
+        return false;
+    }
+    num_tiers_ = 1;
+    return true;
+}
+
+int llama_expert_cache::open_tier(int64_t n_slots, struct ggml_context* ctx, int device_idx,
+                                  std::string& err) {
+    (void)device_idx; // TODO: use for P2P device selection
+    if (num_tiers_ <= 0) {
+        err = "llama_expert_cache: tier 0 must be opened first";
+        return -1;
+    }
+    if (num_tiers_ >= LLAMA_EXPERT_MAX_TIERS) {
+        err = "llama_expert_cache: maximum number of tiers reached";
+        return -1;
+    }
+    if (n_slots <= 0) {
+        err = "llama_expert_cache: n_slots must be positive";
+        return -1;
+    }
+
+    const int tier_idx = num_tiers_;
+    // Reuse tier 0's parameters for layers/experts/blob size
+    if (!tiers_[tier_idx].open(n_slots, tiers_[0].n_layers(), tiers_[0].n_expert(),
+                               tiers_[0].blob_bytes(), ctx, err)) {
+        return -1;
+    }
+    tiers_[tier_idx].set_per_layer_admission(tiers_[0].per_layer_admission());
+    num_tiers_ = tier_idx + 1;
+    return tier_idx;
+}
+
+void llama_expert_cache::close() {
+    for (int i = 0; i < num_tiers_; ++i) {
+        tiers_[i].close();
+    }
+    num_tiers_ = 0;
+}
+
+int64_t llama_expert_cache::total_resident() const {
+    int64_t total = 0;
+    for (int i = 0; i < num_tiers_; ++i) {
+        total += tiers_[i].resident();
+    }
+    return total;
+}
+
+void llama_expert_cache::slot_of(int64_t layer, int64_t expert, int& tier, int32_t& slot) const {
+    tier = -1;
+    slot = LLAMA_EXPERT_NOT_RESIDENT;
+    for (int i = 0; i < num_tiers_; ++i) {
+        const int32_t s = tiers_[i].slot_of(layer, expert);
+        if (s != LLAMA_EXPERT_NOT_RESIDENT) {
+            tier = i;
+            slot = s;
+            return;
+        }
+    }
+}
+
+int llama_expert_cache::admit(int64_t layer, int64_t expert) {
+    for (int i = 0; i < num_tiers_; ++i) {
+        const int32_t s = tiers_[i].admit(layer, expert);
+        if (s != LLAMA_EXPERT_NOT_RESIDENT) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void llama_expert_cache::set_per_layer_admission(bool on) {
+    for (int i = 0; i < num_tiers_; ++i) {
+        tiers_[i].set_per_layer_admission(on);
+    }
+}
+
+void* llama_expert_cache::device_slot(int tier, int32_t slot) {
+    if (tier < 0 || tier >= num_tiers_) return nullptr;
+    return tiers_[tier].device_slot(slot);
+}
+
+const void* llama_expert_cache::device_slot(int tier, int32_t slot) const {
+    if (tier < 0 || tier >= num_tiers_) return nullptr;
+    return tiers_[tier].device_slot(slot);
+}
+
+bool llama_expert_cache::fill_slot_blocking(int tier, int32_t slot, const void* src,
+                                            std::string& err, int64_t bytes) {
+    if (tier < 0 || tier >= num_tiers_) {
+        err = "llama_expert_cache: invalid tier";
+        return false;
+    }
+    return tiers_[tier].fill_slot_blocking(slot, src, err, bytes);
+}
+
+struct ggml_tensor* llama_expert_cache::slot_tensor(int tier, struct ggml_context* graph_ctx,
+                                                    const ggml_tensor* w) const {
+    if (tier < 0 || tier >= num_tiers_) return nullptr;
+    return tiers_[tier].slot_tensor(graph_ctx, w);
+}
+
+struct ggml_tensor* llama_expert_cache::combined_residency_table(struct ggml_context* ctx) const {
+    if (num_tiers_ <= 0) return nullptr;
+
+    const int64_t n = n_layers() * n_expert();
+    struct ggml_tensor* table = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+    if (table == nullptr) return nullptr;
+
+    int32_t* data = (int32_t*)table->data;
+    std::fill(data, data + n, LLAMA_EXPERT_NOT_RESIDENT);
+
+    // Tier 0: slot >= 0
+    if (tiers_[0].valid()) {
+        const int32_t* t0 = tiers_[0].residency_table();
+        for (int64_t i = 0; i < n; ++i) {
+            if (t0[i] >= 0) {
+                data[i] = t0[i];
+            }
+        }
+    }
+
+    // Tier 1: encode as -slot - 1 (only if not already in tier 0)
+    if (num_tiers_ > 1 && tiers_[1].valid()) {
+        const int32_t* t1 = tiers_[1].residency_table();
+        for (int64_t i = 0; i < n; ++i) {
+            if (t1[i] >= 0 && data[i] < 0) {
+                data[i] = -t1[i] - 1;
+            }
+        }
+    }
+
+    return table;
 }
 
 bool llama_read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,

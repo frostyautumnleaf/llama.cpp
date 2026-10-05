@@ -2808,11 +2808,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
         {"--expert-cache"}, "N",
-        "number of VRAM slots for the adaptive expert tier (0 = disabled, default: 0)",
+        "number of VRAM slots for the adaptive expert tier on the main GPU (0 = disabled, default: 0)",
         [](common_params & params, const std::string & value) {
             params.expert_cache_slots = std::stoi(value);
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE"));
+    add_opt(common_arg(
+        {"--expert-cache-secondary"}, "N",
+        "number of VRAM slots for the expert tier on a second GPU (0 = disabled, default: 0)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_secondary_slots = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_SECONDARY"));
+    add_opt(common_arg(
+        {"--expert-cache-tertiary"}, "N",
+        "number of VRAM slots for the expert tier on a third GPU (0 = disabled, default: 0)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_tertiary_slots = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_TERTIARY"));
     add_opt(common_arg(
         {"--expert-profile"}, "FILE",
         "path to expert routing profile (STRP format) for the expert cache",

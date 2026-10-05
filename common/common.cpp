@@ -1280,6 +1280,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // Initialize the adaptive VRAM expert tier if requested
     // Note: this uses the internal model API, so it's only available when building
     // with the full llama library (not just the public API)
+    //
+    // Multi-GPU tiers (Strata's "second GPU as another expert tier"):
+    //   Tier 0: main GPU (--expert-cache N)
+    //   Tier 1: second GPU (--expert-cache-secondary N)
+    //   Tier 2: third GPU (--expert-cache-tertiary N)
+    // Experts are admitted to tier 0 first, then tier 1, then tier 2.
     if (params.expert_cache_slots > 0) {
         // Access the internal model structure to get expert information
         llama_model * model_int = reinterpret_cast<llama_model *>(model);
@@ -1287,20 +1293,16 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         if (hparams.n_expert > 0) {
             // Calculate expert blob size from the first expert tensor
-            // Use the actual tensor size from the model's expert weights
             const ggml_tensor * first_expert_tensor = model_int->get_tensor("blk.0.ffn_gate_exps");
             if (first_expert_tensor == nullptr) {
                 first_expert_tensor = model_int->get_tensor("blk.0.ffn_up_exps");
             }
             int64_t blob_bytes = 0;
             if (first_expert_tensor != nullptr) {
-                // Each expert's weights are a slice of the 3D tensor [n_ff, n_embd, n_expert]
-                // The size of one expert's weights is the total size divided by n_expert
                 blob_bytes = ggml_nbytes(first_expert_tensor) / hparams.n_expert;
                 LOG_INF("expert cache: expert blob size = %lld bytes (from %s)\n",
                         (long long)blob_bytes, first_expert_tensor->name);
             } else {
-                // Fallback: estimate based on model type
                 const int64_t n_ff_exp = hparams.n_ff_exp(0);
                 const int64_t n_embd = hparams.n_embd;
                 blob_bytes = 3 * n_ff_exp * n_embd / 2; // approximate for Q4_K_XL
@@ -1308,15 +1310,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                         (long long)blob_bytes);
             }
 
-            // Get the GPU device for the first MoE layer
-            ggml_backend_dev_t dev = model_int->dev_layer(0);
-            if (dev == nullptr) {
-                LOG_WRN("expert cache: no device for layer 0, using CPU\n");
-            }
-
             // Create a ggml context for the expert cache
             ggml_init_params ctx_params = {
-                /*.mem_size   =*/ 16 * 1024 * 1024, // 16 MB for tensor metadata
+                /*.mem_size   =*/ 32 * 1024 * 1024, // 32 MB for tensor metadata
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ false,
             };
@@ -1326,24 +1322,56 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             } else {
                 std::string err;
                 llama_expert_cache cache;
-                if (cache.open(params.expert_cache_slots, hparams.n_layer(), hparams.n_expert,
-                               blob_bytes, cache_ctx, err)) {
-                    cache.set_per_layer_admission(true);
 
-                    // Load profile if specified
+                // Open tier 0 (main GPU)
+                if (!cache.open(params.expert_cache_slots, hparams.n_layer(), hparams.n_expert,
+                                blob_bytes, cache_ctx, err)) {
+                    LOG_WRN("expert cache: failed to initialize tier 0: %s\n", err.c_str());
+                    ggml_free(cache_ctx);
+                } else {
+                    cache.set_per_layer_admission(true);
+                    LOG_INF("expert cache: tier 0 (main GPU) initialized with %d slots\n",
+                            params.expert_cache_slots);
+
+                    // Open tier 1 (secondary GPU) if requested
+                    if (params.expert_cache_secondary_slots > 0) {
+                        int tier1_idx = cache.open_tier(params.expert_cache_secondary_slots,
+                                                       cache_ctx, 1, err);
+                        if (tier1_idx < 0) {
+                            LOG_WRN("expert cache: failed to initialize tier 1: %s\n", err.c_str());
+                        } else {
+                            LOG_INF("expert cache: tier 1 (secondary GPU) initialized with %d slots\n",
+                                    params.expert_cache_secondary_slots);
+                        }
+                    }
+
+                    // Open tier 2 (tertiary GPU) if requested
+                    if (params.expert_cache_tertiary_slots > 0) {
+                        int tier2_idx = cache.open_tier(params.expert_cache_tertiary_slots,
+                                                       cache_ctx, 2, err);
+                        if (tier2_idx < 0) {
+                            LOG_WRN("expert cache: failed to initialize tier 2: %s\n", err.c_str());
+                        } else {
+                            LOG_INF("expert cache: tier 2 (tertiary GPU) initialized with %d slots\n",
+                                    params.expert_cache_tertiary_slots);
+                        }
+                    }
+
+                    // Load profile if specified and admit experts across all tiers
                     if (!params.expert_profile.empty()) {
                         std::vector<std::pair<int32_t, int32_t>> ranked;
                         int64_t slots = 0;
                         if (llama_read_expert_profile(params.expert_profile, hparams.n_layer(),
                                                       hparams.n_expert, ranked, slots, err)) {
                             // Admit experts from the profile in ranked order
+                            // admit() tries tiers in order (0, 1, 2)
                             for (const auto & [layer, expert] : ranked) {
-                                if (cache.admit(layer, expert) == LLAMA_EXPERT_NOT_RESIDENT) {
-                                    break; // cache is full
+                                if (cache.admit(layer, expert) < 0) {
+                                    break; // all tiers full
                                 }
                             }
-                            LOG_INF("expert cache: loaded profile with %zu ranked pairs, %lld resident\n",
-                                    ranked.size(), (long long)cache.resident());
+                            LOG_INF("expert cache: loaded profile with %zu ranked pairs, %lld total resident\n",
+                                    ranked.size(), (long long)cache.total_resident());
                         } else {
                             LOG_WRN("expert cache: failed to load profile: %s\n", err.c_str());
                         }
@@ -1351,12 +1379,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
                     // Store the cache in the model
                     model_int->expert_cache = std::make_unique<llama_expert_cache>(std::move(cache));
-                    LOG_INF("expert cache: initialized with %d slots, %lld resident, %lld bytes total\n",
-                            params.expert_cache_slots, (long long)model_int->expert_cache->resident(),
-                            (long long)model_int->expert_cache->bytes());
-                } else {
-                    LOG_WRN("expert cache: failed to initialize: %s\n", err.c_str());
-                    ggml_free(cache_ctx);
+                    LOG_INF("expert cache: initialized with %d tiers, %lld total resident experts\n",
+                            model_int->expert_cache->num_tiers(),
+                            (long long)model_int->expert_cache->total_resident());
                 }
             }
         } else {

@@ -487,7 +487,9 @@ struct common_params {
     int32_t yarn_orig_ctx         =     0; // YaRN original context length
 
     // expert cache (adaptive VRAM expert tier, Strata R4)
-    int32_t expert_cache_slots = 0;     // number of expert cache slots (0 = disabled)
+    int32_t expert_cache_slots = 0;     // number of expert cache slots on main GPU (0 = disabled)
+    int32_t expert_cache_secondary_slots = 0; // number of expert cache slots on second GPU (0 = disabled)
+    int32_t expert_cache_tertiary_slots = 0;  // number of expert cache slots on third GPU (0 = disabled)
     std::string expert_profile;         // path to expert routing profile (STRP format)
 
     // offload params

@@ -6,6 +6,8 @@
 #include "llama-cparams.h"
 #include "llama-sampler.h"
 
+#include "ggml-backend.h"
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
@@ -1596,9 +1598,25 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         // Use the cached MoE operation
         // Pass w to slot_tensor() so it can create a properly-shaped view
         // in the graph context
+
+        // For multi-tier, use the combined residency table that encodes (tier, slot)
+        // Tier 0: slot >= 0, Tier 1: slot = -value - 1
+        ggml_tensor * combined_res = expert_cache->combined_residency_table(ctx0);
+        if (combined_res == nullptr) {
+            combined_res = expert_cache->residency_table_tensor(0);
+        }
+
         res = ggml_mul_mat_id_cached(ctx0, w, cur, ids,
-                                     expert_cache->slot_tensor(ctx0, w),
-                                     expert_cache->residency_table_tensor());
+                                     expert_cache->slot_tensor(0, ctx0, w),
+                                     combined_res);
+
+        // Set tier 1 slot tensor for the CUDA kernel (if present)
+        if (expert_cache->num_tiers() > 1) {
+            ggml_cuda_set_expert_cache_tier1_slot_tensor(
+                expert_cache->slot_tensor(1, ctx0, w));
+        } else {
+            ggml_cuda_set_expert_cache_tier1_slot_tensor(nullptr);
+        }
     } else {
         res = ggml_mul_mat_id(ctx0, w, cur, ids);
     }

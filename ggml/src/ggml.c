@@ -8208,3 +8208,9 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
     if (p0->strict_cpu != p1->strict_cpu ) return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
 }
+
+// Expert cache multi-tier support (CUDA)
+// Stub for non-CUDA builds; the real implementation is in ggml-cuda.cu
+void ggml_cuda_set_expert_cache_tier1_slot_tensor(const struct ggml_tensor * tensor) {
+    (void)tensor;
+}
