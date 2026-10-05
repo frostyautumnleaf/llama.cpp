@@ -213,6 +213,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_SETUP generate-models
     )
 
+    # Regression test for the MTP compress-ratio fix (commit 5a60b8258): draft-mtp must run over a fixture that carries an MTP block
+    llama_test(
+        test-llama-archs
+        NAME test-mtp-draft-qwen4exp
+        LABEL main
+        ARGS -a qwen4exp -b CPU
+    )
+
     # Test recurrent-state rollback across all architectures, using the generated dummy models
     llama_test(
         test-recurrent-state-rollback

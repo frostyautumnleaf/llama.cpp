@@ -1,5 +1,6 @@
 #include "common.h"
 #include "log.h"
+#include "speculative.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -187,12 +188,18 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     }
     const uint32_t n_embd_head = n_embd / n_head;
 
+    // qwen4exp ships its MTP block as one trailing layer: block_count counts it and n_layer() subtracts
+    // nextn_predict_layers again. The draft layer is a full-attention QSA layer, and every per-layer array in the
+    // file - compress_ratios above all - stops with the trunk, so the layer that drafts is the one the file says
+    // nothing about. That is the shape of the real file, and it is what aborted draft-mtp; see check_draft_mtp.
+    const uint32_t n_layer_nextn = arch == LLM_ARCH_QWEN4EXP ? 1 : 0;
+
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,      llm_arch_name(arch));
     ms.add_kv(LLM_KV_VOCAB_SIZE,                n_vocab);
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,            n_ctx);
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
-    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer + n_layer_nextn);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
 
     if (arch == LLM_ARCH_K2_HORIZON) {
@@ -317,8 +324,20 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,  1.0e-6f);
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
-        // without this the QSA layers fall back to dense and go uncovered
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+        // without this the QSA layers fall back to dense and go uncovered. block-count long, and 0 for the MTP
+        // layer - the real file carries a ratio where the trunk pools and nothing for the block that trails it, and
+        // a ratio of 0 reads as "no pooling": see check_draft_mtp. (The file also zeroes the trunk layers with no
+        // indexer; every trunk layer pools here, so the nextn entry is the only zero the fixture needs.)
+        {
+            std::vector<uint32_t> ratios(n_layer + n_layer_nextn, 4);
+            for (uint32_t il = n_layer; il < n_layer + n_layer_nextn; ++il) {
+                ratios[il] = 0;
+            }
+            ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, ratios);
+        }
+        if (n_layer_nextn) {
+            ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, n_layer_nextn);
+        }
 
         // has_cell_ext() needs ple_n_heads here: the indexer cache serializes no ext without it
         const uint32_t ple_ngram_size      = 3;
@@ -495,10 +514,12 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr,
+        bool load_mtp = false, uint32_t n_rs_seq = 0) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp          = load_mtp;
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
@@ -511,6 +532,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_threads_batch = 4;
     if (!encode) {
         ctx_params.n_ubatch = 64;
+    }
+    if (n_rs_seq > 0) {
+        ctx_params.n_rs_seq = n_rs_seq;
     }
 
     tensor_data_params tensor_params = { seed, stdev };
@@ -644,6 +668,209 @@ static bool check_causal_attn_toggle(
     }
 
     return ok;
+}
+
+// ---------------------------------------------------------------------------
+// MTP drafting: --spec-type draft-mtp, the model's own drafts
+// ---------------------------------------------------------------------------
+
+// the token the target would sample from one output row: argmax is all the verification below needs, and a fixture
+// whose weights are noise gets its drafts accepted about as often as chance allows
+static llama_token sample_argmax(llama_context * ctx, int32_t i) {
+    const llama_vocab * vocab   = llama_model_get_vocab(llama_get_model(ctx));
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+
+    const float * logits = llama_get_logits_ith(ctx, i);
+    GGML_ASSERT(logits != nullptr);
+
+    llama_token best = 0;
+    for (int32_t j = 1; j < n_vocab; ++j) {
+        if (logits[j] > logits[best]) {
+            best = j;
+        }
+    }
+    return best;
+}
+
+// one round trip of the model's own drafts, over the fixture as the tools run it: prefill, draft, verify against the
+// target, drop what it rejected, draft again. qwen4exp keeps its MTP block in a layer that trails the trunk, and the
+// file says nothing about the compress ratio that layer pools at - the ratio array stops with the trunk, and a ratio
+// of 0 reads as "no pooling". The draft layer then attended densely, nothing consumed the k-pool input's cell
+// indices, the scheduler never allocated that tensor, and set_input wrote through a null buffer: GGML_ASSERT(buffer)
+// in ggml-backend.cpp, for every --spec-type draft-mtp run on the architecture, and for draft-mtp,ngram-suffix too.
+// A fixture that only evals the trunk cannot see any of that, because the k-pool input belongs to the draft graph.
+//
+// this drives the public and common APIs only - libllama exports no internal C++ symbols, so the loader, the graph
+// builders and the drafter are reached the way a tool reaches them.
+static bool check_draft_mtp(
+        struct gguf_context * gguf_ctx, const size_t seed, const float stdev,
+        const std::vector<ggml_backend_dev_t> & devs, const std::string & label) {
+    const int n_prompt = 16;
+    const int n_rounds = 4;
+    const int n_max    = 3;
+
+    const std::vector<llama_token> tokens = get_tokens(n_prompt + n_rounds*(n_max + 1) + 8, 128, seed);
+
+    // declared first, destroyed last: the drafter and the draft context both hold pointers into these
+    // n_rs_seq=4 gives rollback slots for partial speculative acceptance on DSV4 models
+    auto model_and_ctx = get_model_and_ctx(
+            gguf_ctx, nullptr, seed, stdev, devs, LLAMA_SPLIT_MODE_LAYER, /* encode */ false,
+            /* tensor_buft_overrides */ nullptr, /* load_mtp */ true, /* n_rs_seq */ 4);
+
+    llama_model *   model   = model_and_ctx.first.get();
+    llama_context * ctx_tgt = model_and_ctx.second.get();
+
+    if (llama_model_n_layer_nextn(model) != 1) {
+        LOG_ERR("%s: %s: the fixture carries no MTP layer (n_layer_nextn = %d)\n", __func__, label.c_str(),
+                (int) llama_model_n_layer_nextn(model));
+        return false;
+    }
+
+    const llama_token n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    // the draft context is an MTP context over the target's own weights, which is what --spec-type draft-mtp makes
+    common_params params;
+    params.speculative.types                    = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    params.speculative.draft.n_max              = n_max;
+    params.speculative.draft.p_min              = 0.0f; // keep every draft a noise model offers, or nothing is drafted
+    params.speculative.draft.backend_sampling   = false;
+    params.n_ctx              = 256;
+    params.n_batch            = 64;
+    params.n_ubatch           = 64;
+    params.cpuparams.n_threads       = 4;
+    params.cpuparams_batch.n_threads = 4;
+    params.devices            = devs;
+    params.no_perf            = true;
+
+    common_params params_dft = common_base_params_to_speculative(params);
+
+    common_speculative_init_result_ptr spec_init = common_speculative_init_from_params(params_dft, model, ctx_tgt);
+    if (!spec_init || spec_init->context() == nullptr) {
+        LOG_ERR("%s: %s: no MTP draft context\n", __func__, label.c_str());
+        return false;
+    }
+
+    params.speculative.draft.ctx_tgt = ctx_tgt;
+    params.speculative.draft.ctx_dft = spec_init->context();
+
+    llama_context * ctx_dft = params.speculative.draft.ctx_dft;
+
+    common_speculative_ptr spec(common_speculative_init(params.speculative, 1));
+    if (!spec) {
+        LOG_ERR("%s: %s: the MTP drafter did not start\n", __func__, label.c_str());
+        return false;
+    }
+
+    const llama_seq_id seq_id = 0;
+
+    // prefill, and hand the prompt to the drafter, with the last token kept out of the context
+    llama_tokens   prompt;
+    common_batch   batch_tgt(ctx_tgt);
+
+    for (int i = 0; i < n_prompt - 1; ++i) {
+        batch_tgt.add(tokens[i], i, seq_id, true);
+        prompt.push_back(tokens[i]);
+    }
+
+    if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get()) != 0) {
+        LOG_ERR("%s: %s: the target failed on the prompt\n", __func__, label.c_str());
+        return false;
+    }
+    if (!common_speculative_process(spec.get(), batch_tgt)) {
+        LOG_ERR("%s: %s: the drafter failed on the prompt\n", __func__, label.c_str());
+        return false;
+    }
+
+    llama_token id_last = tokens[n_prompt - 1];
+    int         n_past  = n_prompt - 1;
+
+    common_speculative_begin(spec.get(), seq_id, prompt);
+
+    int n_drafts = 0;
+    int n_accept = 0;
+
+    for (int r = 0; r < n_rounds; ++r) {
+        llama_tokens draft;
+
+        common_speculative_get_draft_params(spec.get(), seq_id) = {
+            /* .drafting = */ true,
+            /* .n_max    = */ n_max,
+            /* .pos0     = */ n_past,
+            /* .id_last  = */ id_last,
+            /* .prompt   = */ &prompt,
+            /* .result   = */ &draft, // output
+        };
+
+        common_speculative_draft(spec.get());
+
+        // the draft step wrote ctx_dft KV at pos0..pos0+len; clear that region before verification, as the tools do
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past, -1);
+
+        if (draft.empty()) {
+            LOG_ERR("%s: %s: round %d: the drafter offered nothing\n", __func__, label.c_str(), r);
+            return false;
+        }
+        if ((int) draft.size() > n_max) {
+            LOG_ERR("%s: %s: round %d: drafted %zu over a max of %d\n", __func__, label.c_str(), r, draft.size(), n_max);
+            return false;
+        }
+        for (const llama_token id : draft) {
+            if (id < 0 || id >= n_vocab) {
+                LOG_ERR("%s: %s: round %d: drafted id %d outside the vocabulary\n", __func__, label.c_str(), r, id);
+                return false;
+            }
+        }
+
+        // verify on the target: [id_last, draft0, ...], one output row each
+        batch_tgt.clear();
+        batch_tgt.add(id_last, n_past++, seq_id, true);
+        for (size_t i = 0; i < draft.size(); ++i) {
+            batch_tgt.add(draft[i], n_past + (int) i, seq_id, true);
+        }
+
+        if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get()) != 0) {
+            LOG_ERR("%s: %s: round %d: the target failed on the draft\n", __func__, label.c_str(), r);
+            return false;
+        }
+        if (!common_speculative_process(spec.get(), batch_tgt)) {
+            LOG_ERR("%s: %s: round %d: the drafter failed on the verify batch\n", __func__, label.c_str(), r);
+            return false;
+        }
+
+        // the longest prefix the target agrees with, and the token it samples after that prefix
+        size_t n_acc = 0;
+        while (n_acc < draft.size() && sample_argmax(ctx_tgt, (int32_t) n_acc) == draft[n_acc]) {
+            ++n_acc;
+        }
+        const llama_token next = sample_argmax(ctx_tgt, (int32_t) n_acc);
+
+        // the tail nobody agreed with goes back out of both contexts, as the tools put it back
+        const int n_keep = n_past + (int) n_acc; // the position `next` will be added at
+        if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, n_keep, -1)) {
+            LOG_ERR("%s: %s: round %d: the target kept the rejected tail\n", __func__, label.c_str(), r);
+            return false;
+        }
+        if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_keep, -1)) {
+            LOG_ERR("%s: %s: round %d: the draft context kept the rejected tail\n", __func__, label.c_str(), r);
+            return false;
+        }
+
+        prompt.insert(prompt.end(), draft.begin(), draft.begin() + n_acc);
+        prompt.push_back(next);
+
+        common_speculative_accept(spec.get(), seq_id, (uint16_t) n_acc);
+
+        n_past  = n_keep;
+        id_last = next;
+
+        n_drafts += (int) draft.size();
+        n_accept += (int) n_acc;
+    }
+
+    LOG_INF("%s: %s: %d rounds, %d drafted, %d accepted, %zu tokens committed\n", __func__, label.c_str(),
+            n_rounds, n_drafts, n_accept, prompt.size());
+
+    return true;
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -825,7 +1052,12 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
                 continue;
             }
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
-            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {});
+            // a file that declares nextn layers has to carry the MTP block, so the fixture saves the block its own
+            // metadata promises instead of a file whose arrays and tensors disagree
+            const bool save_mtp = arch == LLM_ARCH_QWEN4EXP;
+            auto model_and_ctx = get_model_and_ctx(
+                    gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, /* encode */ false,
+                    /* tensor_buft_overrides */ nullptr, save_mtp);
             const std::string path = dir + "/" + llm_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
@@ -912,15 +1144,15 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         max_arch_name_length = std::max(max_arch_name_length, strlen(llm_arch_name(arch)));
     }
 
-    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|%15s|\n";
+    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|%15s|%9s|\n";
     const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
-    const std::string template_row_res = "%15s %10s|%20s|%15s %10s|\n";
+    const std::string template_row_res = "%15s %10s|%20s|%15s %10s|%9s|\n";
 
     bool all_ok = true;
     size_t n_tests = 0;
     size_t n_failed = 0;
     common_log_flush(common_log_main());
-    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Mixed batch");
+    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Mixed batch", "MTP draft");
     LOG("|");
     for (size_t i = 0; i < max_arch_name_length; i++) {
         LOG("-");
@@ -929,7 +1161,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     for (size_t i = 0; i < max_device_label_length; i++) {
         LOG("-");
     }
-    LOG("|------|---------------|---------|---------------|\n");
+    LOG("|------|---------------|---------|---------------|---------|\n");
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -953,6 +1185,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 continue;
             }
             const std::string config_name = moe ? "MoE" : "Dense";
+            // qwen4exp's fixture carries an MTP block, and loading with it is what makes the saved file consistent
+            // with the nextn metadata the fixture declares - see check_draft_mtp
+            const bool load_mtp = arch == LLM_ARCH_QWEN4EXP;
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
@@ -974,6 +1209,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 std::string status_mixed     = "\033[1;33mSKIP\033[0m";
+                std::string status_mtp       = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
                 char mixed_str[12] = {0};
 
@@ -982,12 +1218,12 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 bool test_ok = true;
                 if (!skip) {
                     if (logits_cpu.empty()) {
-                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode, /* tensor_buft_overrides */ nullptr, load_mtp);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, load_mtp);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
@@ -1066,6 +1302,17 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             }
                         }
                     }
+
+                    // the MTP draft path lives entirely in the draft graph, so it gets the same fixture loaded a
+                    // second time with the MTP block in it, and the drafter driven over that
+                    if (arch == LLM_ARCH_QWEN4EXP && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                        test_executed = true;
+                        status_mtp = "\033[1;32mOK\033[0m";
+                        if (!check_draft_mtp(gguf_ctx.get(), seed, stdev, dc.devs, dc.label)) {
+                            test_ok    = false;
+                            status_mtp = "\033[1;31mFAIL\033[0m";
+                        }
+                    }
                 }
 
                 if (test_executed) {
@@ -1077,7 +1324,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 }
 
                 // log the results for this test case
-                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_mixed.c_str(), mixed_str);
+                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_mixed.c_str(), mixed_str, status_mtp.c_str());
             }
         }
     }
