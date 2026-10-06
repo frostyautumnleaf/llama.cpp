@@ -382,6 +382,19 @@ struct common_params_speculative_ngram_suffix {
     int32_t max_match = 64;   // longest repeat to look for
     double  margin    = 0.03; // the lookup window has to beat the alternative by this much to be taken
     bool    adaptive  = true; // let the draft policy choose the window size (false: always draft the full proposal)
+
+    // Refined window policy (Strata's plan v0.3 P6 controller): an explicit cost model with per-expert
+    // CPU miss accounting, per-position MTP acceptance tracking, and an expansion mechanism. See
+    // common/spec-controller.h for the full model and defaults (measured on Strata's RTX 5070 with
+    // Qwen3.8-Flash-Next).
+    bool    refined   = false; // use the refined controller instead of the simple draft policy
+    double  min_gain  = 0.05;  // the refined controller only switches when the gain exceeds this
+    double  ema       = 0.05;  // EMA learning rate for acceptance tracking
+    double  dense_ms  = 11.0;  // one-token dense pass (cost model)
+    double  cpu_miss_ms = 15.8; // all experts on CPU (cost model)
+    double  hit_rate  = 0.55;  // share of distinct experts served from VRAM (cost model)
+    double  sync_ms   = 2.4;   // device sync overhead (cost model)
+    double  mtp_draft_ms = 1.2; // per MTP draft token (cost model)
 };
 
 struct common_params_speculative {

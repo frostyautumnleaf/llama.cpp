@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "ngram-suffix.h"
+#include "spec-controller.h"
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -2271,6 +2273,11 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
     // verify round runs over all of them at once, so the rounds they report are the same rounds
     common_draft_policy policy;
 
+    // the refined controller (Strata's plan v0.3 P6): an explicit cost model with per-expert CPU miss
+    // accounting, per-position MTP acceptance tracking, and an expansion mechanism. used when
+    // params.refined is true; otherwise the simple draft policy above is used
+    std::unique_ptr<spec_ctrl::controller> refined_ctrl;
+
     const bool has_alt; // whether another drafter answers the rounds this one declines
     const int  t_alt;   // the window size that drafter would have used (1 + its drafts)
 
@@ -2312,14 +2319,32 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
 
         policy.set_fallback(has_alt);
 
+        if (this->params.refined) {
+            spec_ctrl::cost_model cm;
+            cm.dense_ms        = this->params.dense_ms;
+            cm.cpu_all_miss_ms = this->params.cpu_miss_ms;
+            cm.hit_rate        = this->params.hit_rate;
+            cm.sync_ms         = this->params.sync_ms;
+            cm.mtp_draft_ms    = this->params.mtp_draft_ms;
+            refined_ctrl = std::make_unique<spec_ctrl::controller>(
+                cm, this->params.min_gain, this->params.ema);
+            SPC_TRC("- refined controller enabled: min_gain=%.2f, ema=%.2f, dense=%.1fms, cpu_miss=%.1fms, "
+                    "hit_rate=%.2f, sync=%.1fms, mtp_draft=%.1fms\n",
+                    this->params.min_gain, this->params.ema, this->params.dense_ms,
+                    this->params.cpu_miss_ms, this->params.hit_rate, this->params.sync_ms,
+                    this->params.mtp_draft_ms);
+        }
+
         sinfos.resize(n_seq);
         for (auto & sinfo : sinfos) {
             sinfo.drafter = common_suffix_drafter(this->params.min_match, this->params.max_match);
         }
 
-        SPC_TRC("- n_max=%d, min_match=%d, max_match=%d, margin=%.3f, adaptive=%d, fallback=%s (window %d)\n",
+        SPC_TRC("- n_max=%d, min_match=%d, max_match=%d, margin=%.3f, adaptive=%d, refined=%d, "
+                "fallback=%s (window %d)\n",
                 this->params.n_max, this->params.min_match, this->params.max_match, this->params.margin,
-                this->params.adaptive, has_alt ? "the other drafter" : "plain decoding", t_alt);
+                this->params.adaptive, this->params.refined,
+                has_alt ? "the other drafter" : "plain decoding", t_alt);
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -2402,11 +2427,21 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         int n_draft = k;
 
         if (params.adaptive) {
-            const common_draft_policy::pick p = policy.choose(t_alt, k, sinfo.match);
-            if (!p.lookup) {
-                return; // the alternative is expected to commit more per millisecond: leave it the window
+            if (params.refined && refined_ctrl) {
+                // refined controller: Strata's plan v0.3 P6 with explicit cost model
+                const bool mtp_ready = has_alt && t_alt > 1;
+                const spec_ctrl::choice c = refined_ctrl->choose(k, sinfo.match, mtp_ready);
+                if (c.src != spec_ctrl::source::lookup) {
+                    return; // the controller chose none or MTP: leave the window
+                }
+                n_draft = std::min(k, c.k);
+            } else {
+                const common_draft_policy::pick p = policy.choose(t_alt, k, sinfo.match);
+                if (!p.lookup) {
+                    return; // the alternative is expected to commit more per millisecond: leave it the window
+                }
+                n_draft = std::min(k, p.t - 1);
             }
-            n_draft = std::min(k, p.t - 1);
         }
 
         if (n_draft <= 0) {
@@ -2445,6 +2480,13 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
         sinfo.t_round_us = 0;
 
         if (sinfo.lookup) {
+            if (params.refined && refined_ctrl) {
+                // refined controller: observe the lookup outcome
+                spec_ctrl::choice c;
+                c.src = spec_ctrl::source::lookup;
+                c.k = sinfo.drafts;
+                refined_ctrl->observe(c, n_accepted, sinfo.match);
+            }
             policy.observe(true, sinfo.drafts + 1, n_accepted, sinfo.match, round_ms);
             sinfo.lookup = false;
             return;
@@ -2456,6 +2498,13 @@ struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
 
         // the fallback drafter's round: its window is what the manager says it drafted, plus the token the
         // target always commits; 0 means it abstained too, which is a plain round of one token
+        if (params.refined && refined_ctrl && n_round_draft > 0) {
+            // refined controller: observe the MTP outcome
+            spec_ctrl::choice c;
+            c.src = spec_ctrl::source::mtp;
+            c.k = n_round_draft;
+            refined_ctrl->observe(c, n_accepted, 0);
+        }
         policy.observe(false, n_round_draft > 0 ? n_round_draft + 1 : 1, n_accepted, 0, round_ms);
     }
 };

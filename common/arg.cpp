@@ -4420,6 +4420,83 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--spec-ngram-suffix-refined"},
+        "use Strata's refined window policy (plan v0.3 P6 controller) instead of the simple draft policy: "
+        "an explicit cost model with per-expert CPU miss accounting, per-position MTP acceptance tracking, "
+        "and an expansion mechanism (default: off)",
+        [](common_params & params) {
+            params.speculative.ngram_suffix.refined = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-min-gain"}, "P",
+        string_format("the refined controller only switches when the gain exceeds this fraction (default: %.2f)",
+            (double) params.speculative.ngram_suffix.min_gain),
+        [](common_params & params, const std::string & value) {
+            const float gain = std::stof(value);
+            if (!(gain >= 0.0f && gain <= 10.0f)) {
+                throw std::invalid_argument("ngram-suffix min-gain must be between 0 and 10 inclusive");
+            }
+            params.speculative.ngram_suffix.min_gain = gain;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-ema"}, "P",
+        string_format("EMA learning rate for the refined controller's acceptance tracking (default: %.2f)",
+            (double) params.speculative.ngram_suffix.ema),
+        [](common_params & params, const std::string & value) {
+            const float ema = std::stof(value);
+            if (!(ema > 0.0f && ema <= 1.0f)) {
+                throw std::invalid_argument("ngram-suffix ema must be between 0 and 1 inclusive");
+            }
+            params.speculative.ngram_suffix.ema = ema;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-dense-ms"}, "MS",
+        string_format("one-token dense pass time in ms for the refined controller's cost model (default: %.1f)",
+            (double) params.speculative.ngram_suffix.dense_ms),
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_suffix.dense_ms = std::stod(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-cpu-miss-ms"}, "MS",
+        string_format("all-experts-on-CPU time in ms for the refined controller's cost model (default: %.1f)",
+            (double) params.speculative.ngram_suffix.cpu_miss_ms),
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_suffix.cpu_miss_ms = std::stod(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-hit-rate"}, "P",
+        string_format("share of distinct experts served from VRAM for the refined controller's cost model (default: %.2f)",
+            (double) params.speculative.ngram_suffix.hit_rate),
+        [](common_params & params, const std::string & value) {
+            const float hr = std::stof(value);
+            if (!(hr >= 0.0f && hr <= 1.0f)) {
+                throw std::invalid_argument("ngram-suffix hit-rate must be between 0 and 1 inclusive");
+            }
+            params.speculative.ngram_suffix.hit_rate = hr;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-sync-ms"}, "MS",
+        string_format("device sync overhead in ms for the refined controller's cost model (default: %.1f)",
+            (double) params.speculative.ngram_suffix.sync_ms),
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_suffix.sync_ms = std::stod(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-mtp-draft-ms"}, "MS",
+        string_format("per MTP draft token time in ms for the refined controller's cost model (default: %.1f)",
+            (double) params.speculative.ngram_suffix.mtp_draft_ms),
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_suffix.mtp_draft_ms = std::stod(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",
         string_format("ngram size N for ngram-simple speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_simple.size_n),
         [](common_params & params, int value) {
