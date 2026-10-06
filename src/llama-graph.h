@@ -20,7 +20,8 @@ struct ggml_tensor;
 struct llama_cparams;
 struct llama_layer;
 struct llama_prec_policy;
-class llama_expert_cache;
+
+#include "llama-expert-cache.h"
 
 struct llama_memory_context_i;
 
@@ -962,6 +963,14 @@ public:
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
 
+    // Runtime expert usage tracking (Strata adaptive_tier)
+    // (layer, selected_experts) pairs captured during graph construction
+    struct expert_usage_entry {
+        int64_t layer;
+        ggml_tensor * selected_experts;
+    };
+    std::vector<expert_usage_entry> expert_usage;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
@@ -1075,6 +1084,15 @@ struct llm_graph_context {
     // true when the nextn hidden state must be narrowed to the output rows after it is captured
     bool crop_after_nextn(const ggml_tensor * inp_out_ids) const {
         return inp_out_ids != nullptr && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+    }
+
+    // Record expert usage for runtime adaptation (Strata adaptive_tier)
+    // Captures the selected_experts tensor for a given layer in the graph result
+    // so usage can be recorded after graph computation
+    void record_expert_usage(int64_t layer, ggml_tensor * selected_experts) const {
+        if (expert_cache != nullptr && expert_cache->adaptation_enabled() && selected_experts != nullptr && res != nullptr) {
+            res->expert_usage.push_back({layer, selected_experts});
+        }
     }
 
     //

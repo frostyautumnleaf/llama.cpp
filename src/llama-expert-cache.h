@@ -19,6 +19,13 @@
 //
 // The cache is populated at startup from a routing profile (tools/make_profile.py in Strata)
 // and can be adapted at runtime based on observed routing patterns.
+//
+// Runtime adaptation (Strata's adaptive_tier.cpp):
+//   - Tracks decayed routing usage per (layer, expert) pair
+//   - Periodically re-ranks experts and moves high-usage non-resident experts into
+//     the cache, evicting low-usage resident experts
+//   - Copies are performed asynchronously on a dedicated stream
+//   - Adaptation is triggered every N tokens or explicitly via adapt()
 
 #pragma once
 
@@ -66,6 +73,17 @@ public:
     // Claim the next free slot for (layer, expert)
     int32_t admit(int64_t layer, int64_t expert);
 
+    // Evict (layer, expert) from the cache, freeing its slot
+    // Returns the slot that was freed, or LLAMA_EXPERT_NOT_RESIDENT if not resident
+    int32_t evict(int64_t layer, int64_t expert);
+
+    // Directly set residency for (layer, expert) to a specific slot
+    // Used for swaps where we evict one expert and admit another to the same slot
+    void set_residency(int64_t layer, int64_t expert, int32_t slot);
+
+    // Increment the admitted count (used after set_residency in swap operations)
+    void increment_admitted() { ++admitted_; }
+
     void set_per_layer_admission(bool on) { per_layer_ = on; }
     bool per_layer_admission() const { return per_layer_; }
     void layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const;
@@ -103,6 +121,26 @@ private:
     std::vector<int32_t> layer_next_;  // [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;        // slot offsets when sized
     int64_t admitted_ = 0;
+};
+
+// Callback to copy expert weights from model tensors to a cache slot
+// layer: the layer index
+// expert: the expert index
+// slot_ptr: pointer to the slot memory to fill
+// slot_bytes: size of the slot
+// user_data: user-provided context (e.g., pointer to model)
+typedef void (*llama_expert_copy_fn)(int64_t layer, int64_t expert, void* slot_ptr,
+                                     int64_t slot_bytes, void* user_data);
+
+// Runtime adaptation configuration
+struct llama_expert_adapt_params {
+    int max_moves = 16;           // max experts to move per adaptation pass (Strata default)
+    float usage_threshold = 2.0f; // minimum usage for a non-resident expert to be a candidate
+    float swap_margin = 1.5f;     // candidate must exceed victim usage by this much to swap
+    float decay_factor = 0.7f;    // decay multiplier applied after each adaptation pass
+    int adapt_interval = 32;      // adapt every N tokens (0 = manual only)
+    llama_expert_copy_fn copy_fn = nullptr; // callback to copy expert weights
+    void* copy_user_data = nullptr;         // user data for the copy callback
 };
 
 // Expert cache: multi-tier slot storage and residency tables
@@ -182,9 +220,91 @@ public:
     // Tier access for kernel use
     const llama_expert_cache_tier& tier(int i) const { return tiers_[i]; }
 
+    // ========================================================================
+    // Runtime admission and eviction (Strata's adaptive_tier.cpp)
+    // ========================================================================
+
+    // Enable runtime adaptation with the given parameters
+    // Must be called after open() and before the first inference
+    bool enable_adaptation(const llama_expert_adapt_params& params, std::string& err);
+
+    // Check if adaptation is enabled
+    bool adaptation_enabled() const { return adapt_params_ != nullptr; }
+
+    // Record that expert (layer, expert) was routed to
+    // Called during inference for each (layer, expert) pair that is used
+    void record_usage(int64_t layer, int64_t expert);
+
+    // Record usage for multiple experts at once (batched, more efficient)
+    // ids: array of [n_tokens * n_expert_used] expert IDs for a single layer
+    void record_usage_layer(int64_t layer, const int32_t* ids, int64_t n_entries);
+
+    // Record usage for all layers at once
+    // per_layer_ids: array of [n_layers] pointers, each pointing to [n_tokens * n_expert_used] expert IDs
+    void record_usage_all_layers(const int32_t* const* per_layer_ids, int64_t n_entries_per_layer);
+
+    // Record that N tokens were processed (for adaptation interval tracking)
+    void record_usage_tokens(int64_t n_tokens) {
+        if (adapt_params_ != nullptr) {
+            tokens_since_adapt_ += n_tokens;
+        }
+    }
+
+    // Manually trigger an adaptation pass
+    // Returns the number of experts moved
+    int64_t adapt(std::string& err);
+
+    // Check if adaptation should run based on token count
+    // Returns true if adapt() should be called
+    bool should_adapt() const;
+
+    // Get the current usage count for (layer, expert)
+    float get_usage(int64_t layer, int64_t expert) const;
+
+    // Get the total number of adaptation passes run
+    int64_t adapt_count() const { return adapt_count_; }
+
+    // Get the total number of experts admitted via runtime adaptation
+    int64_t runtime_admitted() const { return runtime_admitted_; }
+
+    // Get the total number of experts evicted via runtime adaptation
+    int64_t runtime_evicted() const { return runtime_evicted_; }
+
+    // Get the total number of experts swapped via runtime adaptation
+    int64_t runtime_swapped() const { return runtime_swapped_; }
+
+    // ========================================================================
+    // Expert usage tracking (captured during graph construction, applied after)
+    // ========================================================================
+
+    // Capture a selected_experts tensor for a layer during graph construction
+    void capture_expert_usage(int64_t layer, struct ggml_tensor* selected_experts);
+
+    // After graph computation, read back captured tensors and update usage
+    void apply_captured_usage();
+
+    // Clear captured usage entries
+    void clear_captured_usage() { captured_usage_.clear(); }
+
 private:
     llama_expert_cache_tier tiers_[LLAMA_EXPERT_MAX_TIERS];
     int num_tiers_ = 0;
+
+    // Runtime adaptation state
+    std::unique_ptr<llama_expert_adapt_params> adapt_params_;
+    std::vector<float> usage_;             // [n_layers * n_expert] decayed routing counts
+    int64_t tokens_since_adapt_ = 0;
+    int64_t adapt_count_ = 0;
+    int64_t runtime_admitted_ = 0;
+    int64_t runtime_evicted_ = 0;
+    int64_t runtime_swapped_ = 0;
+
+    // Captured expert usage entries (layer, selected_experts tensor)
+    struct captured_usage_entry {
+        int64_t layer;
+        struct ggml_tensor* selected_experts;
+    };
+    std::vector<captured_usage_entry> captured_usage_;
 };
 
 // Read an expert profile from a file (Strata's STRP format)

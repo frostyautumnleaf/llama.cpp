@@ -1474,6 +1474,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // Apply expert usage tracking for runtime adaptation (Strata adaptive_tier)
+    if (model.expert_cache && model.expert_cache->adaptation_enabled() && !res->expert_usage.empty()) {
+        for (const auto & entry : res->expert_usage) {
+            ggml_tensor * sel = entry.selected_experts;
+            if (sel == nullptr) continue;
+
+            const int64_t n_entries = sel->ne[0] * sel->ne[1];
+            if (n_entries <= 0) continue;
+
+            // Get the backend for this tensor
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), sel);
+            if (backend == nullptr) continue;
+
+            // Copy the tensor to host
+            std::vector<int32_t> ids(n_entries);
+            ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, n_entries * sizeof(int32_t));
+
+            // Update usage counters
+            model.expert_cache->record_usage_layer(entry.layer, ids.data(), n_entries);
+        }
+        res->expert_usage.clear();
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2114,6 +2137,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // Runtime expert cache adaptation (Strata adaptive_tier)
+    // Check if adaptation should run based on token count
+    if (model.expert_cache && model.expert_cache->adaptation_enabled()) {
+        model.expert_cache->record_usage_tokens(n_tokens_all);
+        if (model.expert_cache->should_adapt()) {
+            std::string adapt_err;
+            int64_t moves = model.expert_cache->adapt(adapt_err);
+            if (!adapt_err.empty()) {
+                LLAMA_LOG_WARN("%s: expert cache adaptation failed: %s\n", __func__, adapt_err.c_str());
+            } else if (moves > 0) {
+                LLAMA_LOG_INFO("%s: expert cache adapted %lld experts after %lld tokens\n",
+                               __func__, (long long)moves, (long long)n_tokens_all);
+            }
+        }
+    }
 
     return 0;
 }

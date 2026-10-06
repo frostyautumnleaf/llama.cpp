@@ -492,6 +492,11 @@ struct common_params {
     int32_t expert_cache_tertiary_slots = 0;  // number of expert cache slots on third GPU (0 = disabled)
     std::string expert_profile;         // path to expert routing profile (STRP format)
 
+    // runtime expert cache adaptation (Strata adaptive_tier)
+    bool expert_adapt = false;          // enable runtime adaptation
+    int32_t expert_adapt_interval = 32; // adapt every N tokens
+    int32_t expert_adapt_max_moves = 16; // max experts to move per pass
+
     // KV streaming (Strata's resident window)
     // When set, the full KV cache is stored in RAM and only N entries are kept
     // resident in VRAM at any time. Needed entries are streamed from RAM to VRAM

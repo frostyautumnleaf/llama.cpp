@@ -749,6 +749,14 @@ struct llama_model {
     // adaptive VRAM expert tier (Strata R4)
     std::unique_ptr<llama_expert_cache> expert_cache;
 
+    // Runtime expert usage tracking (Strata adaptive_tier)
+    // Captured during graph construction, applied after computation
+    struct expert_usage_entry {
+        int64_t layer;
+        ggml_tensor * selected_experts;
+    };
+    std::vector<expert_usage_entry> expert_usage_entries;
+
     // KV streaming (Strata's resident window)
     std::unique_ptr<llama_kv_stream> kv_stream;
 

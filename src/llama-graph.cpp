@@ -1543,7 +1543,6 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
 }
 
 
-
 ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
@@ -2202,6 +2201,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
+
+    // Record expert usage for runtime adaptation (Strata adaptive_tier)
+    record_expert_usage(il, selected_experts);
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented

@@ -1401,6 +1401,69 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                     LOG_INF("expert cache: initialized with %d tiers, %lld total resident experts\n",
                             model_int->expert_cache->num_tiers(),
                             (long long)model_int->expert_cache->total_resident());
+
+                    // Enable runtime adaptation if requested
+                    if (params.expert_adapt) {
+                        llama_expert_adapt_params adapt_params;
+                        adapt_params.adapt_interval = params.expert_adapt_interval;
+                        adapt_params.max_moves = params.expert_adapt_max_moves;
+
+                        // Copy callback: copy expert weights from model tensors to slot
+                        // The slot contains concatenated gate, up, and down expert weights
+                        auto copy_expert_weights = [](int64_t layer, int64_t expert, void* slot_ptr,
+                                                      int64_t slot_bytes, void* user_data) {
+                            (void)slot_bytes;
+                            llama_model* model = static_cast<llama_model*>(user_data);
+                            int64_t slot_offset = 0;
+
+                            // Copy gate expert weights
+                            {
+                                std::string name = "blk." + std::to_string(layer) + ".ffn_gate_exps";
+                                const ggml_tensor* t = model->get_tensor(name.c_str());
+                                if (t != nullptr) {
+                                    const int64_t expert_bytes = ggml_nbytes(t) / t->ne[2];
+                                    const void* src = (const char*)t->data + expert * expert_bytes;
+                                    memcpy((char*)slot_ptr + slot_offset, src, expert_bytes);
+                                    slot_offset += expert_bytes;
+                                }
+                            }
+
+                            // Copy up expert weights
+                            {
+                                std::string name = "blk." + std::to_string(layer) + ".ffn_up_exps";
+                                const ggml_tensor* t = model->get_tensor(name.c_str());
+                                if (t != nullptr) {
+                                    const int64_t expert_bytes = ggml_nbytes(t) / t->ne[2];
+                                    const void* src = (const char*)t->data + expert * expert_bytes;
+                                    memcpy((char*)slot_ptr + slot_offset, src, expert_bytes);
+                                    slot_offset += expert_bytes;
+                                }
+                            }
+
+                            // Copy down expert weights
+                            {
+                                std::string name = "blk." + std::to_string(layer) + ".ffn_down_exps";
+                                const ggml_tensor* t = model->get_tensor(name.c_str());
+                                if (t != nullptr) {
+                                    const int64_t expert_bytes = ggml_nbytes(t) / t->ne[2];
+                                    const void* src = (const char*)t->data + expert * expert_bytes;
+                                    memcpy((char*)slot_ptr + slot_offset, src, expert_bytes);
+                                    slot_offset += expert_bytes;
+                                }
+                            }
+                        };
+
+                        adapt_params.copy_fn = copy_expert_weights;
+                        adapt_params.copy_user_data = model_int;
+
+                        std::string adapt_err;
+                        if (model_int->expert_cache->enable_adaptation(adapt_params, adapt_err)) {
+                            LOG_INF("expert cache: runtime adaptation enabled (interval=%d, max_moves=%d)\n",
+                                    params.expert_adapt_interval, params.expert_adapt_max_moves);
+                        } else {
+                            LOG_WRN("expert cache: failed to enable adaptation: %s\n", adapt_err.c_str());
+                        }
+                    }
                 }
             }
         } else {

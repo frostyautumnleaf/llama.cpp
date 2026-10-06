@@ -2835,6 +2835,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_PROFILE"));
     add_opt(common_arg(
+        {"--expert-adapt"}, "",
+        "enable runtime expert cache adaptation (admit/evict based on routing usage)",
+        [](common_params & params, const std::string &) {
+            params.expert_adapt = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_ADAPT"));
+    add_opt(common_arg(
+        {"--expert-adapt-interval"}, "N",
+        "adapt expert cache every N tokens (default: 32)",
+        [](common_params & params, const std::string & value) {
+            params.expert_adapt_interval = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_EXPERT_ADAPT_INTERVAL"));
+    add_opt(common_arg(
+        {"--expert-adapt-max-moves"}, "N",
+        "max experts to move per adaptation pass (default: 16)",
+        [](common_params & params, const std::string & value) {
+            params.expert_adapt_max_moves = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_EXPERT_ADAPT_MAX_MOVES"));
+    add_opt(common_arg(
         {"--kv-resident"}, "N",
         "number of KV entries to keep resident in VRAM (0 = disabled, all in VRAM; "
         "full KV cache stored in RAM, needed entries streamed to VRAM before attention)",

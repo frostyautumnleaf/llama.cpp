@@ -5,9 +5,13 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include "llama-impl.h"
+
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <functional>
+#include <utility>
 
 // ============================================================================
 // llama_expert_cache_tier: single-GPU expert cache
@@ -204,6 +208,31 @@ int32_t llama_expert_cache_tier::admit(int64_t layer, int64_t expert) {
     }
     residency_[at] = (int32_t)next_free_;
     return (int32_t)next_free_++;
+}
+
+int32_t llama_expert_cache_tier::evict(int64_t layer, int64_t expert) {
+    if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) {
+        return LLAMA_EXPERT_NOT_RESIDENT;
+    }
+    const size_t at = (size_t)(layer * n_expert_ + expert);
+    if (residency_[at] == LLAMA_EXPERT_NOT_RESIDENT) {
+        return LLAMA_EXPERT_NOT_RESIDENT;
+    }
+    const int32_t slot = residency_[at];
+    residency_[at] = LLAMA_EXPERT_NOT_RESIDENT;
+    --admitted_;
+    return slot;
+}
+
+void llama_expert_cache_tier::set_residency(int64_t layer, int64_t expert, int32_t slot) {
+    if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) {
+        return;
+    }
+    const size_t at = (size_t)(layer * n_expert_ + expert);
+    if (residency_[at] == slot) {
+        return; // no change
+    }
+    residency_[at] = slot;
 }
 
 void* llama_expert_cache_tier::device_slot(int32_t slot) {
@@ -504,6 +533,243 @@ struct ggml_tensor* llama_expert_cache::combined_residency_table(struct ggml_con
     }
 
     return table;
+}
+
+// ============================================================================
+// Runtime admission and eviction (Strata's adaptive_tier.cpp)
+// ============================================================================
+
+bool llama_expert_cache::enable_adaptation(const llama_expert_adapt_params& params,
+                                           std::string& err) {
+    if (!valid()) {
+        err = "llama_expert_cache: adaptation requires an open cache";
+        return false;
+    }
+    if (adapt_params_ != nullptr) {
+        err = "llama_expert_cache: adaptation already enabled";
+        return false;
+    }
+    if (params.copy_fn == nullptr) {
+        err = "llama_expert_cache: adaptation requires a copy_fn callback";
+        return false;
+    }
+
+    adapt_params_ = std::make_unique<llama_expert_adapt_params>(params);
+    usage_.assign(n_layers() * n_expert(), 0.0f);
+    tokens_since_adapt_ = 0;
+    adapt_count_ = 0;
+    runtime_admitted_ = 0;
+    runtime_evicted_ = 0;
+    runtime_swapped_ = 0;
+
+    LLAMA_LOG_INFO("%s: runtime adaptation enabled (max_moves=%d, threshold=%.1f, swap_margin=%.1f, decay=%.1f, interval=%d)\n",
+                   __func__, params.max_moves, params.usage_threshold, params.swap_margin,
+                   params.decay_factor, params.adapt_interval);
+
+    return true;
+}
+
+void llama_expert_cache::record_usage(int64_t layer, int64_t expert) {
+    if (usage_.empty() || layer < 0 || layer >= n_layers() || expert < 0 || expert >= n_expert()) {
+        return;
+    }
+    usage_[(size_t)(layer * n_expert() + expert)] += 1.0f;
+}
+
+void llama_expert_cache::record_usage_layer(int64_t layer, const int32_t* ids, int64_t n_entries) {
+    if (usage_.empty() || layer < 0 || layer >= n_layers() || ids == nullptr) {
+        return;
+    }
+    const size_t base = (size_t)layer * n_expert();
+    for (int64_t i = 0; i < n_entries; ++i) {
+        const int64_t e = ids[i];
+        if (e >= 0 && e < n_expert()) {
+            usage_[base + (size_t)e] += 1.0f;
+        }
+    }
+}
+
+void llama_expert_cache::record_usage_all_layers(const int32_t* const* per_layer_ids, int64_t n_entries_per_layer) {
+    if (usage_.empty() || per_layer_ids == nullptr) {
+        return;
+    }
+    for (int64_t l = 0; l < n_layers(); ++l) {
+        record_usage_layer(l, per_layer_ids[l], n_entries_per_layer);
+    }
+}
+
+bool llama_expert_cache::should_adapt() const {
+    if (adapt_params_ == nullptr) {
+        return false;
+    }
+    if (adapt_params_->adapt_interval <= 0) {
+        return false; // manual only
+    }
+    return tokens_since_adapt_ >= adapt_params_->adapt_interval;
+}
+
+float llama_expert_cache::get_usage(int64_t layer, int64_t expert) const {
+    if (usage_.empty() || layer < 0 || layer >= n_layers() || expert < 0 || expert >= n_expert()) {
+        return 0.0f;
+    }
+    return usage_[(size_t)(layer * n_expert() + expert)];
+}
+
+int64_t llama_expert_cache::adapt(std::string& err) {
+    (void)err;
+    if (adapt_params_ == nullptr || !valid()) {
+        return 0;
+    }
+
+    const int64_t nl = n_layers();
+    const int64_t ne = n_expert();
+    const float threshold = adapt_params_->usage_threshold;
+    const float swap_margin = adapt_params_->swap_margin;
+    const int max_moves = adapt_params_->max_moves;
+
+    int64_t total_moves = 0;
+
+    // For each layer, identify candidates (non-resident, high usage) and victims (resident, low usage)
+    for (int64_t l = 0; l < nl; ++l) {
+        if (total_moves >= max_moves) break;
+
+        const size_t base = (size_t)l * ne;
+
+        // Collect candidates: non-resident experts with usage >= threshold
+        std::vector<std::pair<float, int64_t>> candidates;
+        // Collect victims: resident experts (with their slot)
+        std::vector<std::pair<float, std::pair<int64_t, int32_t>>> victims;
+
+        for (int64_t e = 0; e < ne; ++e) {
+            const float usage = usage_[base + (size_t)e];
+            const int32_t slot = tiers_[0].slot_of(l, e);
+
+            if (slot == LLAMA_EXPERT_NOT_RESIDENT) {
+                if (usage >= threshold) {
+                    candidates.emplace_back(usage, e);
+                }
+            } else {
+                victims.emplace_back(std::make_pair(usage, std::make_pair(e, slot)));
+            }
+        }
+
+        if (candidates.empty()) continue;
+
+        // Sort candidates by usage (descending) - highest usage first
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        // Sort victims by usage (ascending) - lowest usage first (best eviction candidates)
+        std::sort(victims.begin(), victims.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        // First, try to fill free slots
+        size_t ci = 0;
+        while (ci < candidates.size() && total_moves < max_moves) {
+            const int64_t expert = candidates[ci].second;
+            const int32_t slot = tiers_[0].admit(l, expert);
+            if (slot == LLAMA_EXPERT_NOT_RESIDENT) {
+                break; // no more free slots
+            }
+
+            // Copy expert weights from model tensor to slot via callback
+            if (adapt_params_->copy_fn != nullptr) {
+                void* slot_ptr = tiers_[0].device_slot(slot);
+                adapt_params_->copy_fn(l, expert, slot_ptr, blob_bytes(), adapt_params_->copy_user_data);
+            }
+
+            ++runtime_admitted_;
+            ++total_moves;
+            ++ci;
+        }
+
+        // Then, swap out low-usage residents for high-usage non-residents
+        size_t vi = 0;
+        while (ci < candidates.size() && vi < victims.size() && total_moves < max_moves) {
+            const float cand_usage = candidates[ci].first;
+            const float vict_usage = victims[vi].first;
+            const int64_t vict_expert = victims[vi].second.first;
+            const int32_t vict_slot = victims[vi].second.second;
+
+            // Swap only if candidate usage exceeds victim usage by the margin
+            if (cand_usage < vict_usage + swap_margin) {
+                break; // no more worthwhile swaps
+            }
+
+            const int64_t cand_expert = candidates[ci].second;
+
+            // Evict victim: clear its residency entry
+            tiers_[0].evict(l, vict_expert);
+            ++runtime_evicted_;
+
+            // Admit candidate to the freed slot
+            tiers_[0].set_residency(l, cand_expert, vict_slot);
+            tiers_[0].increment_admitted();
+
+            // Copy expert weights from model tensor to slot via callback
+            if (adapt_params_->copy_fn != nullptr) {
+                void* slot_ptr = tiers_[0].device_slot(vict_slot);
+                adapt_params_->copy_fn(l, cand_expert, slot_ptr, blob_bytes(), adapt_params_->copy_user_data);
+            }
+
+            ++runtime_swapped_;
+            ++total_moves;
+            ++ci;
+            ++vi;
+        }
+    }
+
+    // Decay usage counts after adaptation
+    if (!usage_.empty() && adapt_params_->decay_factor > 0.0f && adapt_params_->decay_factor < 1.0f) {
+        const float decay = adapt_params_->decay_factor;
+        for (float& u : usage_) {
+            u *= decay;
+        }
+    }
+
+    tokens_since_adapt_ = 0;
+    ++adapt_count_;
+
+    if (total_moves > 0) {
+        LLAMA_LOG_INFO("%s: adapted %lld experts (admitted=%lld, evicted=%lld, swapped=%lld)\n",
+                       __func__, (long long)total_moves, (long long)runtime_admitted_,
+                       (long long)runtime_evicted_, (long long)runtime_swapped_);
+    }
+
+    return total_moves;
+}
+
+void llama_expert_cache::capture_expert_usage(int64_t layer, struct ggml_tensor* selected_experts) {
+    if (adapt_params_ == nullptr || selected_experts == nullptr) {
+        return;
+    }
+    captured_usage_.push_back({layer, selected_experts});
+}
+
+void llama_expert_cache::apply_captured_usage() {
+    if (captured_usage_.empty() || adapt_params_ == nullptr) {
+        return;
+    }
+
+    for (const auto& entry : captured_usage_) {
+        ggml_tensor* sel = entry.selected_experts;
+        if (sel == nullptr) continue;
+
+        const int64_t n_expert_used = sel->ne[0];
+        const int64_t n_tokens = sel->ne[1];
+        const int64_t n_entries = n_expert_used * n_tokens;
+
+        if (n_entries <= 0) continue;
+
+        // Copy tensor data to host
+        std::vector<int32_t> ids(n_entries);
+        memcpy(ids.data(), sel->data, n_entries * sizeof(int32_t));
+
+        // Update usage counters
+        record_usage_layer(entry.layer, ids.data(), n_entries);
+    }
+
+    captured_usage_.clear();
 }
 
 bool llama_read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
