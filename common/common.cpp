@@ -10,6 +10,7 @@
 #include "../src/llama-kv-stream.h"
 #include "../src/llama-model.h"
 #include "../src/llama-hparams.h"
+#include "../src/llama-context.h"
 
 #include "fit.h"
 #include "log.h"
@@ -1511,12 +1512,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(mem);
             if (kv != nullptr) {
                 // Get the main GPU device
-                ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_TYPE_CUDA, 0);
+                ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
                 if (dev == nullptr) {
-                    dev = ggml_backend_dev_by_type(GGML_BACKEND_TYPE_METAL, 0);
+                    dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
                 }
                 if (dev == nullptr) {
-                    dev = ggml_backend_dev_by_type(GGML_BACKEND_TYPE_VULKAN, 0);
+                    dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL);
                 }
 
                 if (dev != nullptr) {

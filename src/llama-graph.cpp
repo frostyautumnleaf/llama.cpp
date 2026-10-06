@@ -1527,6 +1527,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     prec_policy      (params.prec_policy),
     expert_cache     (params.expert_cache),
+    kv_stream        (params.kv_stream),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -3031,8 +3032,17 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
         }
 
-        k = mctx_cur->get_k(ctx0, il);
-        v = mctx_cur->get_v(ctx0, il);
+        // KV streaming: if enabled, stream the most recent entries to VRAM
+        // and use the VRAM window tensors for attention
+        if (kv_stream != nullptr && kv_stream->valid()) {
+            const uint32_t n_kv = mctx_cur->get_n_kv();
+            kv_stream->stream_layer(il, n_kv);
+            k = kv_stream->get_k(il, ctx0, n_kv);
+            v = kv_stream->get_v(il, ctx0, n_kv);
+        } else {
+            k = mctx_cur->get_k(ctx0, il);
+            v = mctx_cur->get_v(ctx0, il);
+        }
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
@@ -3125,7 +3135,14 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k;
+    if (kv_stream != nullptr && kv_stream->valid()) {
+        const uint32_t n_kv = mctx_cur->get_n_kv();
+        kv_stream->stream_layer(il, n_kv);
+        k = kv_stream->get_k(il, ctx0, n_kv);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+    }
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
@@ -3210,7 +3227,14 @@ ggml_tensor * llm_graph_context::build_attn(
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k;
+    if (kv_stream != nullptr && kv_stream->valid()) {
+        const uint32_t n_kv = mctx_cur->get_n_kv();
+        kv_stream->stream_layer(il, n_kv);
+        k = kv_stream->get_k(il, ctx0, n_kv);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+    }
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
@@ -3297,8 +3321,20 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k;
+    ggml_tensor * v;
+    if (use_kv_cur) {
+        k = k_cur;
+        v = v_cur;
+    } else if (kv_stream != nullptr && kv_stream->valid()) {
+        const uint32_t n_kv = mctx_cur->get_n_kv();
+        kv_stream->stream_layer(il, n_kv);
+        k = kv_stream->get_k(il, ctx0, n_kv);
+        v = kv_stream->get_v(il, ctx0, n_kv);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+        v = mctx_cur->get_v(ctx0, il);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -3368,7 +3404,14 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // MLA-style attention: the cached K is used as V
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k;
+    if (kv_stream != nullptr && kv_stream->valid()) {
+        const uint32_t n_kv = mctx_cur->get_n_kv();
+        kv_stream->stream_layer(il, n_kv);
+        k = kv_stream->get_k(il, ctx0, n_kv);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+    }
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);

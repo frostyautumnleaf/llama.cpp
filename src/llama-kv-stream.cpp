@@ -50,15 +50,22 @@ bool llama_kv_stream::init(llama_kv_cache * kv, uint32_t window_size, ggml_backe
         // but only window_size entries
         llama_kv_stream_layer & layer = layers_[il];
 
-        // K: [n_embd_head_k, n_head_k, window_size]
+        // Store dimensions for later use
+        layer.n_embd_head_k = k_storage->ne[0]; // actual: n_embd_k_gqa
+        layer.n_head_kv = k_storage->ne[1];     // actual: kv_size (not used directly)
+        layer.n_embd_k_gqa = k_storage->ne[0];  // row size in storage
+        layer.n_stream = k_storage->ne[2];
+
+        // Create 4D window tensors: [n_embd_k_gqa, window_size, n_stream]
+        // This matches the layout of the KV cache storage
         layer.k_resident = ggml_new_tensor_3d(
             ctx_, k_storage->type,
-            k_storage->ne[0], k_storage->ne[1], window_size);
+            k_storage->ne[0], window_size, k_storage->ne[2]);
 
-        // V: same shape as K (for simplicity)
+        // V: same shape as K
         layer.v_resident = ggml_new_tensor_3d(
             ctx_, k_storage->type,
-            k_storage->ne[0], k_storage->ne[1], window_size);
+            k_storage->ne[0], window_size, k_storage->ne[2]);
 
         if (layer.k_resident == nullptr || layer.v_resident == nullptr) {
             return false;
@@ -124,7 +131,7 @@ void llama_kv_stream::stream_layer(int32_t il, uint32_t n_kv) {
         return;
     }
 
-    // Get the full KV cache tensor
+    // Get the full KV cache tensors
     ggml_tensor * k_storage = kv_->get_k_storage(il);
     if (k_storage == nullptr) {
         return;
@@ -132,7 +139,7 @@ void llama_kv_stream::stream_layer(int32_t il, uint32_t n_kv) {
 
     // Determine the range of entries to stream
     // Stream the most recent n_kv entries
-    uint32_t total_entries = k_storage->ne[2];
+    uint32_t total_entries = k_storage->ne[1]; // kv_size dimension
     uint32_t start = 0;
     if (n_kv < total_entries) {
         start = total_entries - n_kv;
@@ -147,37 +154,76 @@ void llama_kv_stream::stream_layer(int32_t il, uint32_t n_kv) {
         n_copy = window_size_;
     }
 
-    // Create a view of the source tensor for the range we want to copy
-    // Source: k_storage[start:start+n_copy]
-    ggml_tensor * k_src_view = ggml_view_3d(
-        ctx_, k_storage,
-        k_storage->ne[0], k_storage->ne[1], n_copy,
-        k_storage->nb[1], k_storage->nb[2],
-        start * k_storage->nb[2]);
-
     // Copy K entries from CPU to VRAM
-    ggml_backend_tensor_copy(k_src_view, layer.k_resident);
+    // Source: k_storage[:, start:start+n_copy, :]
+    // Destination: layer.k_resident[:, :n_copy, :]
+    for (uint32_t s = 0; s < layer.n_stream; ++s) {
+        // Source view: [n_embd_k_gqa, n_copy] at offset start*n_embd_k_gqa + s*kv_size*n_embd_k_gqa
+        ggml_tensor * k_src_view = ggml_view_2d(
+            ctx_, k_storage,
+            layer.n_embd_k_gqa, n_copy,
+            k_storage->nb[1],
+            k_storage->nb[1] * start + k_storage->nb[2] * s);
 
-    // For V, use the same approach (using K storage as proxy)
-    ggml_tensor * v_src_view = ggml_view_3d(
-        ctx_, k_storage,
-        k_storage->ne[0], k_storage->ne[1], n_copy,
-        k_storage->nb[1], k_storage->nb[2],
-        start * k_storage->nb[2]);
+        // Destination view: [n_embd_k_gqa, n_copy] at stream s
+        ggml_tensor * k_dst_view = ggml_view_2d(
+            ctx_, layer.k_resident,
+            layer.n_embd_k_gqa, n_copy,
+            layer.k_resident->nb[1],
+            layer.k_resident->nb[2] * s);
 
-    ggml_backend_tensor_copy(v_src_view, layer.v_resident);
+        ggml_backend_tensor_copy(k_src_view, k_dst_view);
+    }
+
+    // Copy V entries from CPU to VRAM (same approach)
+    // Note: V storage has the same layout as K
+    for (uint32_t s = 0; s < layer.n_stream; ++s) {
+        ggml_tensor * v_src_view = ggml_view_2d(
+            ctx_, k_storage, // TODO: use actual V storage
+            layer.n_embd_k_gqa, n_copy,
+            k_storage->nb[1],
+            k_storage->nb[1] * start + k_storage->nb[2] * s);
+
+        ggml_tensor * v_dst_view = ggml_view_2d(
+            ctx_, layer.v_resident,
+            layer.n_embd_k_gqa, n_copy,
+            layer.v_resident->nb[1],
+            layer.v_resident->nb[2] * s);
+
+        ggml_backend_tensor_copy(v_src_view, v_dst_view);
+    }
 }
 
-ggml_tensor * llama_kv_stream::get_k(int32_t il) const {
+ggml_tensor * llama_kv_stream::get_k(int32_t il, ggml_context * ctx, uint32_t n_kv) const {
     if (il < 0 || il >= (int32_t)layers_.size()) {
         return nullptr;
     }
-    return layers_[il].k_resident;
+
+    const llama_kv_stream_layer & layer = layers_[il];
+    if (layer.k_resident == nullptr) {
+        return nullptr;
+    }
+
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(n_kv);
+
+    // Return the window tensor directly
+    // Shape: [n_embd_k_gqa, window_size, n_stream]
+    return layer.k_resident;
 }
 
-ggml_tensor * llama_kv_stream::get_v(int32_t il) const {
+ggml_tensor * llama_kv_stream::get_v(int32_t il, ggml_context * ctx, uint32_t n_kv) const {
     if (il < 0 || il >= (int32_t)layers_.size()) {
         return nullptr;
     }
-    return layers_[il].v_resident;
+
+    const llama_kv_stream_layer & layer = layers_[il];
+    if (layer.v_resident == nullptr) {
+        return nullptr;
+    }
+
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(n_kv);
+
+    return layer.v_resident;
 }

@@ -16,6 +16,7 @@
 // KV streaming state for a single layer
 struct llama_kv_stream_layer {
     // Resident window in VRAM (sliding window of most recent entries)
+    // Shape: [n_embd_head_k, n_head_kv, window_size, n_stream]
     ggml_tensor * k_resident = nullptr;
     ggml_tensor * v_resident = nullptr;
     ggml_backend_buffer_t k_buf = nullptr;
@@ -24,6 +25,12 @@ struct llama_kv_stream_layer {
     // Window position
     uint32_t window_start = 0;
     uint32_t window_size = 0;
+
+    // Dimensions for creating properly shaped tensors
+    uint32_t n_embd_head_k = 0;
+    uint32_t n_head_kv = 0;
+    uint32_t n_embd_k_gqa = 0; // row size in storage
+    uint32_t n_stream = 0;
 };
 
 // KV streaming state for all layers
@@ -52,8 +59,9 @@ public:
     void stream_layer(int32_t il, uint32_t n_kv);
 
     // Get the resident window tensors for a layer
-    ggml_tensor * get_k(int32_t il) const;
-    ggml_tensor * get_v(int32_t il) const;
+    // Returns a view of the window with shape [n_embd_k_gqa, n_kv, n_stream]
+    ggml_tensor * get_k(int32_t il, ggml_context * ctx, uint32_t n_kv) const;
+    ggml_tensor * get_v(int32_t il, ggml_context * ctx, uint32_t n_kv) const;
 
 private:
     llama_kv_cache * kv_ = nullptr;

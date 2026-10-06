@@ -2607,6 +2607,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.prec_policy =*/ &model.prec_policy,
         /*.expert_cache =*/ model.expert_cache ? model.expert_cache.get() : nullptr,
+        /*.kv_stream   =*/ model.kv_stream ? model.kv_stream.get() : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
