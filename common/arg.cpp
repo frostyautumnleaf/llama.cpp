@@ -2835,6 +2835,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_PROFILE"));
     add_opt(common_arg(
+        {"--kv-resident"}, "N",
+        "number of KV entries to keep resident in VRAM (0 = disabled, all in VRAM; "
+        "full KV cache stored in RAM, needed entries streamed to VRAM before attention)",
+        [](common_params & params, const std::string & value) {
+            params.kv_resident = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_KV_RESIDENT"));
+    add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"

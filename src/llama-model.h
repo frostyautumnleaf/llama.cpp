@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 #include "llama-expert-cache.h"
+#include "llama-kv-stream.h"
 
 #include <map>
 #include <memory>
@@ -747,6 +748,9 @@ struct llama_model {
 
     // adaptive VRAM expert tier (Strata R4)
     std::unique_ptr<llama_expert_cache> expert_cache;
+
+    // KV streaming (Strata's resident window)
+    std::unique_ptr<llama_kv_stream> kv_stream;
 
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;

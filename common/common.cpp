@@ -7,6 +7,7 @@
 
 #include "../src/llama-ext.h"
 #include "../src/llama-expert-cache.h"
+#include "../src/llama-kv-stream.h"
 #include "../src/llama-model.h"
 #include "../src/llama-hparams.h"
 
@@ -1498,6 +1499,44 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->context.reset(lctx);
+
+    // Initialize KV streaming if requested
+    if (params.kv_resident > 0) {
+        // Access the internal context to get the KV cache
+        llama_context * lctx_int = reinterpret_cast<llama_context *>(lctx);
+        llama_memory_t mem = lctx_int->get_memory();
+
+        if (mem != nullptr) {
+            // Cast the memory to a KV cache
+            llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(mem);
+            if (kv != nullptr) {
+                // Get the main GPU device
+                ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_TYPE_CUDA, 0);
+                if (dev == nullptr) {
+                    dev = ggml_backend_dev_by_type(GGML_BACKEND_TYPE_METAL, 0);
+                }
+                if (dev == nullptr) {
+                    dev = ggml_backend_dev_by_type(GGML_BACKEND_TYPE_VULKAN, 0);
+                }
+
+                if (dev != nullptr) {
+                    llama_kv_stream * kv_stream = new llama_kv_stream();
+                    if (kv_stream->init(kv, params.kv_resident, dev)) {
+                        LOG_INF("kv streaming: initialized with %d resident entries on GPU\n",
+                                params.kv_resident);
+                        // Store the KV stream in the model for later use
+                        llama_model * model_int = reinterpret_cast<llama_model *>(model);
+                        model_int->kv_stream.reset(kv_stream);
+                    } else {
+                        LOG_WRN("kv streaming: failed to initialize\n");
+                        delete kv_stream;
+                    }
+                } else {
+                    LOG_WRN("kv streaming: no GPU device found\n");
+                }
+            }
+        }
+    }
 
     set_process_priority(params.cpuparams.priority);
 

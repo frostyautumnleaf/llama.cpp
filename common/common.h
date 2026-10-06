@@ -492,6 +492,12 @@ struct common_params {
     int32_t expert_cache_tertiary_slots = 0;  // number of expert cache slots on third GPU (0 = disabled)
     std::string expert_profile;         // path to expert routing profile (STRP format)
 
+    // KV streaming (Strata's resident window)
+    // When set, the full KV cache is stored in RAM and only N entries are kept
+    // resident in VRAM at any time. Needed entries are streamed from RAM to VRAM
+    // before each attention operation. 0 = disabled (all KV in VRAM).
+    int32_t kv_resident = 0;
+
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
