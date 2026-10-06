@@ -163,6 +163,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-spec-suffix.cpp)
     # the refined speculative window policy (Strata's plan v0.3 P6 controller)
     llama_build_and_test(test-spec-controller.cpp)
+    # mul_mat_id over expert-cache slots: quantized slots and per-layer residency
+    llama_build_and_test(test-mul-mat-id-cached.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
     llama_build_and_test(test-grammar-integration.cpp)

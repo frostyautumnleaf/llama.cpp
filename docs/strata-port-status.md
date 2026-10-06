@@ -23,6 +23,16 @@ Measured on this branch against `master` (cb7934c52) and Strata's own sources.
 batch has outputs, `k_idxs` kept in the graph, the saver writing `n_layer_all` for per-layer arrays. These are
 what let `draft-mtp` run at all on this model.
 
+**The expert-cache kernel itself** (`GGML_OP_MUL_MAT_ID_CACHED`), CPU path - `tests/test-mul-mat-id-cached`.
+The cache is still inert (nothing hands it a tensor yet, see below); this is the op underneath it, which is
+now correct and testable on its own. The reference is plain `mul_mat_id` over the model weights with the
+expert ids resolved through the residency table - the same bytes through the same kind of dot product - for
+F32/F16/Q8_0/Q4_K, two layers with deliberately different residency rows, 720 outputs each, matching exactly.
+Three mutations were run against it to check it fails for the right reasons: ignoring the residency table
+(fails, all four types), indexing the table by expert instead of by `(layer, expert)` (fails at layer 1, all
+four), and reading the slot bytes as floats (fails for Q8_0 and Q4_K). The comparison has to be NaN-aware -
+the first version of this test passed all three mutations, because every comparison against NaN is false.
+
 ## Ported but not functional - arguments accepted and ignored
 
 `--expert-cache`, `--expert-cache-secondary`, `--expert-cache-tertiary`, `--expert-adapt`,
@@ -45,15 +55,24 @@ These now warn once and are ignored. Before that they were fatal, which is why t
 4. **One arena cannot serve every MoE projection.** `build_lora_mm_id` routes *all* MoE matmuls - gate_up and
    down, which differ in shape - through one `slot_tensor`, so `cached->nb[2]` is the wrong stride for at
    least one of them.
-5. **The kernel reads the wrong residency rows.** The table is `[n_layers * n_expert]`, but both kernels index
-   it as `residency_host[i02]` over `ne02 == n_expert`, so every layer reads layer 0's residency.
+5. ~~**The kernel reads the wrong residency rows.**~~ **Fixed** (see `test-mul-mat-id-cached`): the table is
+   `[n_layers * n_expert]` and both kernels used to index it as `residency_host[i02]` over
+   `ne02 == n_expert`, so every layer read layer 0's residency. A node now carries its layer
+   (`ggml_mul_mat_id_cached(..., layer, ...)`, `op_params[1]`) and reads that row.
 6. **Tier 1 and tier 2 are never reachable.** `ggml_cuda_set_expert_cache_tier1_slot_tensor`,
    `..._tier2_...` and `..._tier1_slots` are defined and never called from anywhere, so `cached1`/`cached2`
    are null in the kernel and tier 1/2 experts silently fall back to the original weights.
-7. **`GGML_OP_MUL_MAT_ID_CACHED` is missing its plumbing.** It is absent from CUDA `supports_op` (which ends
-   in `default: return false`), absent from `ggml_op_alloc_size_may_expand`, absent from the CPU work-size
-   switch, and the CPU path computes in a scalar loop that only handles F32/F16 - for a quantized `src0` it
-   reads quantized bytes as floats.
+7. **`GGML_OP_MUL_MAT_ID_CACHED` is missing its plumbing.** Partly fixed:
+   - ~~the CPU path computes in a scalar loop that only handles F32/F16 - for a quantized `src0` it reads
+     quantized bytes as floats~~ **Fixed.** The CPU kernel is now the `mul_mat_id` body with the per-expert
+     base pointer resolved through the residency table, so it keeps the per-type `vec_dot`, the `src1`
+     conversion and the threading. Registered in the CPU work-size switch and the task-count switch (it
+     shares `mul_mat_id`'s layout); the tiled path is skipped when the weights come from a slot.
+   - still absent from CUDA `supports_op`, which ends in `default: return false`, so no CUDA backend
+     claims the op today. (`ggml_op_alloc_size_may_expand` turned out not to need it: that list only
+     allows for a backend whose alloc size exceeds `ggml_nbytes`, and this op's output is plain F32.)
+   - both kernels now reject a residency entry that names a slot the arena does not have, instead of
+     reading past the end of it.
 8. **`--kv-resident` corrupts output.** `llama_kv_stream::stream_layer` copies K storage into the V window
    (`k_storage`, marked `// TODO: use actual V storage`), and `get_k`/`get_v` return the whole fixed window
    regardless of `n_kv`, so attention reads stale and wrong cells. It also sizes its layer array from

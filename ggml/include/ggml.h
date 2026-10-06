@@ -1505,13 +1505,24 @@ extern "C" {
             struct ggml_tensor  * ids);
 
     // indirect matrix multiplication with expert cache
+    //
     // as: original expert weights [n_ff, n_embd, n_expert]
     // b: input [n_embd, 1, n_tokens]
     // ids: selected expert IDs [n_expert_used, n_tokens]
-    // cached: cached expert weights [n_ff, n_embd, n_slots]
-    // residency: residency table [n_expert] (I32, slot index or -1)
-    // cached1: tier 1 cached expert weights (optional, nullptr if not used)
-    // cached2: tier 2 cached expert weights (optional, nullptr if not used)
+    // cached: tier 0 arena - a view over the cache slot storage for *this projection*,
+    //         [n_ff, n_embd, n_slots] with nb[2] = the whole slot stride, which is >= one
+    //         expert blob of `as` (a slot may hold several projections; each projection gets
+    //         its own view of it, offset to its part). Holds byte-for-byte copies of experts
+    //         of `as`, so type/ne[0]/ne[1]/nb[0]/nb[1] must match `as`.
+    // residency: [n_layers * n_expert] I32 table, one row per layer, encoding:
+    //            >= 0  : tier 0, slot = value
+    //            -1    : not resident, read the weights from `as`
+    //            <= -2 : val = -value - 2; val < tier1_slots -> tier 1 slot val,
+    //                    else tier 2 slot val - tier1_slots
+    // layer: which row of the residency table this node reads. Required - the table is shared
+    //        by every layer, and without it every layer would read layer 0's residency.
+    // cached1: tier 1 arena (optional, nullptr if not used)
+    // cached2: tier 2 arena (optional, nullptr if not used)
     // tier1_slots: number of slots in tier 1 (for residency table decoding)
     GGML_API struct ggml_tensor * ggml_mul_mat_id_cached(
             struct ggml_context * ctx,
@@ -1520,6 +1531,7 @@ extern "C" {
             struct ggml_tensor  * ids,
             struct ggml_tensor  * cached,
             struct ggml_tensor  * residency,
+            int32_t               layer,
             struct ggml_tensor  * cached1,
             struct ggml_tensor  * cached2,
             int32_t              tier1_slots);

@@ -1551,9 +1551,56 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
-static void ggml_compute_forward_mul_mat_id(
+// MUL_MAT_ID_CACHED needs one extra thing on top of MUL_MAT_ID: for each expert it is about to
+// multiply, it has to ask the residency table where that expert's weights live - a slot in one of
+// the tier arenas, or the model weights. Everything else (grouping the rows by expert, converting
+// src1 to vec_dot_type, the chunking, the per-type vec_dot) is identical, so the two ops share the
+// body below and only differ in the base pointer used for a given expert.
+struct mmid_cache {
+    int32_t             layer;       // which row of the residency table this node reads
+    int32_t             tier1_slots;
+    const struct ggml_tensor * tier[3];     // arena views, tier[0] always present
+    const int32_t     * residency;   // [n_layers * n_expert], see ggml_mul_mat_id_cached()
+};
+
+// Resolve expert `cur_a` to the base pointer of its weights. Returns NULL if the residency entry
+// is inconsistent with the arenas, which is a bug in the cache rather than a runtime condition.
+static const char * ggml_mmid_cached_select(
+        const struct mmid_cache * cache, int64_t n_expert, int64_t cur_a, const char * orig) {
+    const int32_t enc = cache->residency[(int64_t) cache->layer * n_expert + cur_a];
+
+    if (enc == -1) {
+        return orig; // not resident
+    }
+
+    int slot;
+    const struct ggml_tensor * arena;
+
+    if (enc >= 0) {
+        slot  = enc;
+        arena = cache->tier[0];
+    } else {
+        const int32_t val = -enc - 2;
+        if (val < cache->tier1_slots) {
+            slot  = val;
+            arena = cache->tier[1];
+        } else {
+            slot  = val - cache->tier1_slots;
+            arena = cache->tier[2];
+        }
+    }
+
+    if (arena == NULL || slot < 0 || slot >= (int32_t) arena->ne[2]) {
+        return NULL;
+    }
+
+    return (const char *) arena->data + (size_t) slot * arena->nb[2];
+}
+
+static void ggml_compute_forward_mul_mat_id_impl(
         const struct ggml_compute_params * params,
-              struct ggml_tensor * dst) {
+              struct ggml_tensor * dst,
+        const struct mmid_cache * cache) {
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1675,12 +1722,20 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        // tiled takes over if profitable for this expert (see tiled.h)
-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+        // tiled takes over if profitable for this expert (see tiled.h). It reads dst->src[0]
+        // directly, so it cannot be used when the weights come from a cache slot.
+        if (!cache && ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        if (cache) {
+            src0_cur = ggml_mmid_cached_select(cache, n_as, cur_a, src0_cur);
+            if (src0_cur == NULL) {
+                GGML_ABORT("mul_mat_id_cached: residency entry for layer %d expert %lld does not resolve to a valid cache slot",
+                           cache->layer, (long long) cur_a);
+            }
+        }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1736,221 +1791,56 @@ static void ggml_compute_forward_mul_mat_id(
 }
 
 // ggml_compute_forward_mul_mat_id_cached
-// Indirect matrix multiplication with expert cache.
-// For each selected expert, checks the residency table. If resident, uses cached weights;
-// otherwise uses original weights.
+// MUL_MAT_ID where the weights for an expert may live in one of the cache's tier arenas instead of
+// in the model (Strata's expert cache). The residency table is indexed by (layer, expert), so the
+// node carries the layer it belongs to, and each arena is a per-projection view over the slot
+// storage.
+//
+// This used to be a hand-written scalar loop that read the cached *and* the original weights as
+// floats, so for any quantized src0 it multiplied raw quantized bytes and only F32/F16 came out
+// right. It is now the MUL_MAT_ID body with the per-expert base pointer resolved through the
+// residency table, which keeps the per-type vec_dot, the src1 conversion and the threading.
 
 static void ggml_compute_forward_mul_mat_id_cached(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0      = dst->src[0];
+    const struct ggml_tensor * residency = dst->src[4];
 
-    const struct ggml_tensor * src0   = dst->src[0]; // original expert weights [n_ff, n_embd, n_expert]
-    const struct ggml_tensor * src1   = dst->src[1]; // input [n_embd, 1, n_tokens]
-    const struct ggml_tensor * ids    = dst->src[2]; // selected expert IDs [n_expert_used, n_tokens]
-    const struct ggml_tensor * cached = dst->src[3]; // tier 0 cached expert weights [n_ff, n_embd, n_slots]
-    const struct ggml_tensor * residency = dst->src[4]; // residency table [n_expert] (I32, encoded tier/slot)
-    const struct ggml_tensor * cached1 = dst->src[5]; // tier 1 cached expert weights (optional)
-    const struct ggml_tensor * cached2 = dst->src[6]; // tier 2 cached expert weights (optional)
+    GGML_ASSERT(dst->src[3] != NULL && "mul_mat_id_cached: tier 0 arena is required");
+    GGML_ASSERT(residency->type == GGML_TYPE_I32);
+    GGML_ASSERT(residency->ne[0] % src0->ne[2] == 0);
 
-    // Read tier1_slots from op_params (first 4 bytes)
-    int32_t tier1_slots = 0;
-    memcpy(&tier1_slots, dst->op_params, sizeof(int32_t));
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    const enum ggml_type type = src0->type;
-
-    const bool src1_cont = ggml_is_contiguous(src1);
-
-    enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
-    ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
-
-    // we don't support permuted src0 or src1
-    GGML_ASSERT(nb00 == ggml_type_size(type));
-    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
-
-    // dst cannot be transposed or permuted
-    GGML_ASSERT(nb0 == sizeof(float));
-    GGML_ASSERT(nb0 <= nb1);
-    GGML_ASSERT(nb1 <= nb2);
-    GGML_ASSERT(nb2 <= nb3);
-
-    // row groups
-    const int n_ids = ids->ne[0]; // n_expert_used
-    const int n_as  = ne02;       // n_expert
-
-    void * wdata_cur = params->wdata;
-
-    if (src1->type != vec_dot_type) {
-        incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
-    }
-
-    int64_t * matrix_row_counts = // [n_as]
-        incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
-
-    struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
-        incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
-
-    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
-        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
-
-    GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
-
-    if (src1->type != vec_dot_type) {
-        char * wdata = params->wdata;
-
-        const size_t nbw0 = ggml_type_size(vec_dot_type);
-        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
-        const size_t nbw2 = nbw1*ne11;
-        const size_t nbw3 = nbw2*ne12;
-
-        assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
-
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
-                }
-            }
-        }
-    }
-
-    if (ith == 0) {
-        // initialize matrix_row_counts
-        memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
-
-        // group rows by src0 matrix
-        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
-            for (int id = 0; id < n_ids; ++id) {
-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
-
-                assert(i02 >= 0 && i02 < n_as);
-
-                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
-                matrix_row_counts[i02] += 1;
-            }
-        }
-    }
-
-    // reset current_chunk
-    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
-        *current_chunk_ctr = nth;
-    }
-
-    ggml_barrier(params->threadpool);
-
-    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-        const int64_t cne1 = matrix_row_counts[cur_a];
-
-        if (cne1 == 0) {
+    // the arenas hold byte-for-byte copies of experts of src0, so they have to look exactly like
+    // src0 to the per-type vec_dot - assert it instead of multiplying garbage
+    for (int t = 0; t < 3; ++t) {
+        const struct ggml_tensor * arena = t == 0 ? dst->src[3] : (t == 1 ? dst->src[5] : dst->src[6]);
+        if (arena == NULL) {
             continue;
         }
-
-        // Check if this expert is resident in the cache (multi-tier)
-        // Encoding: enc >= 0 → tier 0 slot=enc; enc == -1 → not resident;
-        // enc <= -2 → val=-enc-2; if val < tier1_slots → tier 1 slot=val;
-        // else → tier 2 slot=val-tier1_slots
-        const int32_t enc = *(const int32_t *) ((const char *) residency->data + cur_a*residency->nb[0]);
-
-        // Get the appropriate weights pointer
-        const char * src0_cur;
-        const char * cached_cur = NULL;
-        size_t cached_nb1 = 0; // row stride for cached weights
-        enum ggml_type cached_type = GGML_TYPE_F32;
-        bool use_cached = false;
-
-        if (enc >= 0) {
-            // Tier 0: main cache
-            use_cached = true;
-            cached_cur = (const char *) cached->data + enc * cached->nb[2];
-            cached_nb1 = cached->nb[1];
-            cached_type = cached->type;
-        } else if (enc <= -2) {
-            const int32_t val = -enc - 2;
-            if (val < tier1_slots && cached1 != NULL) {
-                // Tier 1
-                use_cached = true;
-                cached_cur = (const char *) cached1->data + val * cached1->nb[2];
-                cached_nb1 = cached1->nb[1];
-                cached_type = cached1->type;
-            } else if (val >= tier1_slots && cached2 != NULL) {
-                // Tier 2
-                use_cached = true;
-                cached_cur = (const char *) cached2->data + (val - tier1_slots) * cached2->nb[2];
-                cached_nb1 = cached2->nb[1];
-                cached_type = cached2->type;
-            }
-        }
-
-        if (use_cached) {
-            src0_cur = cached_cur;
-        } else {
-            // Use original weights
-            src0_cur = (const char *) src0->data + cur_a * nb02;
-        }
-
-        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
-        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
-
-        const int64_t nr0 = ne01;
-        const int64_t nr1 = cne1;
-
-        // Simple single-threaded computation for this chunk
-        for (int64_t ir1 = 0; ir1 < nr1; ++ir1) {
-            struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
-            const int id       = row_mapping.i1; // selected expert index
-            const int64_t  i11 = id % ne11;
-            const int64_t  i12 = row_mapping.i2; // row index in src1
-
-            const char * src1_col = (const char *) wdata +
-                (src1_cont || src1->type != vec_dot_type
-                ? (i11      + i12*ne11)*row_size
-                : (i11*nb11 + i12*nb12));
-
-            float * dst_col = (float *) ((char *) dst->data + (id*nb1 + i12*nb2));
-
-            for (int64_t ir0 = 0; ir0 < nr0; ++ir0) {
-                float sum = 0.0f;
-                const float * src1_row = (const float *) src1_col;
-                if (use_cached) {
-                    if (cached_type == GGML_TYPE_F32) {
-                        const float * w = (const float *) (src0_cur + ir0 * cached_nb1);
-                        for (int64_t i = 0; i < ne00; ++i) {
-                            sum += w[i] * src1_row[i];
-                        }
-                    } else if (cached_type == GGML_TYPE_F16) {
-                        const ggml_fp16_t * w = (const ggml_fp16_t *) (src0_cur + ir0 * cached_nb1);
-                        for (int64_t i = 0; i < ne00; ++i) {
-                            sum += ggml_fp16_to_fp32(w[i]) * src1_row[i];
-                        }
-                    } else {
-                        // Fallback: use original weights
-                        const float * w = (const float *) (src0_cur + ir0 * nb01);
-                        for (int64_t i = 0; i < ne00; ++i) {
-                            sum += w[i] * src1_row[i];
-                        }
-                    }
-                } else {
-                    // Original weights
-                    const float * w = (const float *) (src0_cur + ir0 * nb01);
-                    for (int64_t i = 0; i < ne00; ++i) {
-                        sum += w[i] * src1_row[i];
-                    }
-                }
-                dst_col[ir0] = sum;
-            }
-        }
+        GGML_ASSERT(arena->type  == src0->type);
+        GGML_ASSERT(arena->ne[0] == src0->ne[0] && arena->ne[1] == src0->ne[1]);
+        GGML_ASSERT(arena->nb[0] == src0->nb[0] && arena->nb[1] == src0->nb[1]);
+        GGML_ASSERT(arena->nb[2] >= src0->nb[2]);
     }
+
+    struct mmid_cache cache;
+    cache.tier1_slots = ggml_get_op_params_i32(dst, 0);
+    cache.layer       = ggml_get_op_params_i32(dst, 1);
+    cache.tier[0]     = dst->src[3];
+    cache.tier[1]     = dst->src[5];
+    cache.tier[2]     = dst->src[6];
+    cache.residency   = (const int32_t *) residency->data;
+
+    GGML_ASSERT(cache.layer >= 0 && (int64_t) cache.layer < residency->ne[0] / src0->ne[2]);
+
+    ggml_compute_forward_mul_mat_id_impl(params, dst, &cache);
+}
+
+static void ggml_compute_forward_mul_mat_id(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    ggml_compute_forward_mul_mat_id_impl(params, dst, NULL);
 }
 
 /////////////////////////////////
@@ -2581,6 +2471,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ID_CACHED:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;
@@ -3113,6 +3004,7 @@ struct ggml_cplan ggml_graph_plan(
                         cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
                 case GGML_OP_MUL_MAT_ID:
+                case GGML_OP_MUL_MAT_ID_CACHED: // same body, so the same work buffer layout
                     {
                         cur = 0;
                         const struct ggml_tensor * src0 = node->src[0];

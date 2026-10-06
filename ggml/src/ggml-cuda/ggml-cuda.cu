@@ -2046,9 +2046,11 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     const ggml_tensor * cached1   = dst->src[5]; // tier 1 cached expert weights (optional)
     const ggml_tensor * cached2   = dst->src[6]; // tier 2 cached expert weights (optional)
 
-    // Read tier1_slots from op_params (first 4 bytes)
+    // Read tier1_slots and the layer from op_params
     int32_t tier1_slots = 0;
-    memcpy(&tier1_slots, dst->op_params, sizeof(int32_t));
+    int32_t layer       = 0;
+    memcpy(&tier1_slots, dst->op_params + 0, sizeof(int32_t));
+    memcpy(&layer,       dst->op_params + 1, sizeof(int32_t));
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -2056,13 +2058,17 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    GGML_ASSERT(residency->ne[0] % ne02 == 0);       // [n_layers * n_expert]
+    GGML_ASSERT(layer >= 0 && layer < (int32_t) (residency->ne[0] / ne02));
+
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     cudaStream_t stream = ctx.stream();
 
-    // Copy the residency table from device to host (it's small: n_expert int32 values)
+    // Copy this layer's row of the residency table from device to host (it's small: n_expert int32
+    // values). Indexing the table by expert alone would make every layer read layer 0's residency.
     std::vector<int32_t> residency_host(ne02);
-    CUDA_CHECK(cudaMemcpyAsync(residency_host.data(), residency->data, ne02 * sizeof(int32_t),
-                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(residency_host.data(), (const char *) residency->data + (size_t) layer * ne02 * sizeof(int32_t),
+                               ne02 * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Copy the IDs from device to host (needed for sorting)
@@ -2150,17 +2156,23 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
             weights_nb2 = cached->nb[2];
         } else if (enc <= -2) {
             const int32_t val = -enc - 2;
-            if (val < tier1_slots && cached1 != nullptr) {
+            if (val < tier1_slots) {
                 // Tier 1: secondary GPU cache
                 weights_src = cached1;
                 weights_idx = val;
-                weights_nb2 = weights_src->nb[2];
-            } else if (val >= tier1_slots && cached2 != nullptr) {
+            } else {
                 // Tier 2: tertiary GPU cache
                 weights_src = cached2;
                 weights_idx = val - tier1_slots;
-                weights_nb2 = weights_src->nb[2];
             }
+            weights_nb2 = weights_src != nullptr ? weights_src->nb[2] : nb02;
+        }
+
+        // a residency entry naming a slot the arena does not have would read past the end of it,
+        // so refuse rather than multiply whatever is there
+        if (weights_src != src0 && (weights_src == nullptr || weights_idx < 0 || weights_idx >= (int64_t) weights_src->ne[2])) {
+            GGML_ABORT("mul_mat_id_cached: residency entry %d for layer %d expert %" PRId64 " does not resolve to a valid cache slot",
+                       enc, layer, i02);
         }
 
         // Create a slice of the weights for this expert/slot

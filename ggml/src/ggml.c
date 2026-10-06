@@ -3426,6 +3426,19 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+// an arena is a view over slot storage holding byte-for-byte copies of experts of `as`, so the
+// rows have to line up exactly or the backend will read a quant block out of the wrong place.
+static void ggml_mul_mat_id_cached_assert_arena(const struct ggml_tensor * as, const struct ggml_tensor * arena, int tier) {
+    GGML_ASSERT(arena != NULL  && "expert cache: tier arena must not be null");
+    GGML_ASSERT(arena->type == as->type);
+    GGML_ASSERT(arena->ne[0] == as->ne[0] && arena->ne[1] == as->ne[1]);
+    GGML_ASSERT(arena->nb[0] == as->nb[0] && arena->nb[1] == as->nb[1]);
+    // nb[2] of `as` is one expert blob; a slot is at least that big (usually bigger, since it
+    // holds every projection of the expert and each projection views its own part of it)
+    GGML_ASSERT(arena->ne[2] > 0 && arena->nb[2] >= as->nb[2]);
+    GGML_UNUSED(tier);
+}
+
 struct ggml_tensor * ggml_mul_mat_id_cached(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,
@@ -3433,9 +3446,10 @@ struct ggml_tensor * ggml_mul_mat_id_cached(
         struct ggml_tensor  * ids,
         struct ggml_tensor  * cached,
         struct ggml_tensor  * residency,
+        int32_t               layer,
         struct ggml_tensor  * cached1,
         struct ggml_tensor  * cached2,
-        int32_t              tier1_slots) {
+        int32_t               tier1_slots) {
     GGML_ASSERT(!ggml_is_transposed(as));
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
     GGML_ASSERT(residency->type == GGML_TYPE_I32);
@@ -3446,6 +3460,24 @@ struct ggml_tensor * ggml_mul_mat_id_cached(
     GGML_ASSERT(ids->ne[1] == b->ne[2]); // must have an expert list per b row
     GGML_ASSERT(as->ne[0] == b->ne[0]); // can_mul_mat
     GGML_ASSERT(ids->ne[0] % b->ne[1] == 0); // can broadcast
+
+    GGML_ASSERT(cached != NULL && "expert cache: tier 0 arena is required");
+    ggml_mul_mat_id_cached_assert_arena(as, cached, 0);
+    if (cached1) {
+        ggml_mul_mat_id_cached_assert_arena(as, cached1, 1);
+        GGML_ASSERT(tier1_slots == (int32_t) cached1->ne[2]);
+    } else {
+        GGML_ASSERT(tier1_slots == 0);
+    }
+    if (cached2) {
+        ggml_mul_mat_id_cached_assert_arena(as, cached2, 2);
+    }
+
+    // the residency table is one row per layer for the whole model - a node has to say which row
+    // it wants, otherwise every layer reads layer 0's residency
+    GGML_ASSERT(layer >= 0);
+    GGML_ASSERT(residency->ne[0] % as->ne[2] == 0);
+    GGML_ASSERT((int64_t) layer < residency->ne[0] / as->ne[2]);
 
     const int64_t ne[4] = { as->ne[1], ids->ne[0], b->ne[2], 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
@@ -3459,9 +3491,9 @@ struct ggml_tensor * ggml_mul_mat_id_cached(
     result->src[5] = cached1;
     result->src[6] = cached2;
 
-    // Store tier1_slots in op_params (first 4 bytes)
     memset(result->op_params, 0, sizeof(result->op_params));
-    memcpy(result->op_params, &tier1_slots, sizeof(int32_t));
+    memcpy(result->op_params + 0, &tier1_slots, sizeof(int32_t));
+    memcpy(result->op_params + 1, &layer,       sizeof(int32_t));
 
     return result;
 }
