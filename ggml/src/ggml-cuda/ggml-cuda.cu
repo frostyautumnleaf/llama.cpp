@@ -1993,22 +1993,36 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 // Indirect matrix multiplication with expert cache (multi-tier).
 //
 // Residency table encoding (int32 per expert):
-//   value >= 0: resident in tier 0 (main GPU), slot index = value
-//   value <  0: resident in tier 1 (secondary GPU), slot index = -value - 1
+//   value >= 0:  resident in tier 0 (main GPU), slot index = value
+//   value == -1: not resident
+//   value <= -2: val = -value - 2; if val < tier1_slots → tier 1 slot=val;
+//                else → tier 2 slot=val-tier1_slots
 //
 // Tier 0 uses src3 (cached slot tensor). Tier 1 uses g_expert_cache_tier1_slot_tensor,
-// which is set by the graph builder before execution. If not set, tier 1 experts
-// fall back to original weights.
+// tier 2 uses g_expert_cache_tier2_slot_tensor. Both are set by the graph builder
+// before execution. If a tier's slot tensor is not set, experts in that tier fall
+// back to original weights.
 //
 // Implementation: Uses the same host-side sorting approach as ggml_cuda_mul_mat_id,
 // but for each expert, checks the residency table and selects the appropriate
-// weights (cached tier 0, cached tier 1, or original) before performing the matmul.
+// weights (cached tier 0, cached tier 1, cached tier 2, or original) before
+// performing the matmul.
 
 // Global pointer to tier 1 slot tensor, set by graph builder
 static const ggml_tensor * g_expert_cache_tier1_slot_tensor = nullptr;
+static int g_expert_cache_tier1_slots = 0;
+static const ggml_tensor * g_expert_cache_tier2_slot_tensor = nullptr;
 
 void ggml_cuda_set_expert_cache_tier1_slot_tensor(const ggml_tensor * tensor) {
     g_expert_cache_tier1_slot_tensor = tensor;
+}
+
+void ggml_cuda_set_expert_cache_tier2_slot_tensor(const ggml_tensor * tensor) {
+    g_expert_cache_tier2_slot_tensor = tensor;
+}
+
+void ggml_cuda_set_expert_cache_tier1_slots(int slots) {
+    g_expert_cache_tier1_slots = slots;
 }
 
 static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2101,25 +2115,34 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
         }
 
         // Decode the residency table entry
+        // Encoding: enc >= 0 → tier 0 slot=enc; enc == -1 → not resident;
+        // enc <= -2 → val=-enc-2; if val < tier1_slots → tier 1 slot=val;
+        // else → tier 2 slot=val-tier1_slots
         const int32_t enc = residency_host[i02];
-        const bool tier0_resident = (enc >= 0);
-        const bool tier1_resident = (!tier0_resident && g_expert_cache_tier1_slot_tensor != nullptr);
 
         // Select the appropriate weights tensor
         const ggml_tensor * weights_src = src0;
         int64_t weights_idx = i02;
         size_t weights_nb2 = nb02;
 
-        if (tier0_resident) {
+        if (enc >= 0) {
             // Tier 0: main GPU cache (fast path)
             weights_src = cached;
             weights_idx = enc;
             weights_nb2 = cached->nb[2];
-        } else if (tier1_resident) {
-            // Tier 1: secondary GPU cache
-            weights_src = g_expert_cache_tier1_slot_tensor;
-            weights_idx = -enc - 1;
-            weights_nb2 = weights_src->nb[2];
+        } else if (enc <= -2) {
+            const int32_t val = -enc - 2;
+            if (val < g_expert_cache_tier1_slots && g_expert_cache_tier1_slot_tensor != nullptr) {
+                // Tier 1: secondary GPU cache
+                weights_src = g_expert_cache_tier1_slot_tensor;
+                weights_idx = val;
+                weights_nb2 = weights_src->nb[2];
+            } else if (val >= g_expert_cache_tier1_slots && g_expert_cache_tier2_slot_tensor != nullptr) {
+                // Tier 2: tertiary GPU cache
+                weights_src = g_expert_cache_tier2_slot_tensor;
+                weights_idx = val - g_expert_cache_tier1_slots;
+                weights_nb2 = weights_src->nb[2];
+            }
         }
 
         // Create a slice of the weights for this expert/slot

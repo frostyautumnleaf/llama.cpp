@@ -159,8 +159,10 @@ public:
     struct ggml_tensor* residency_table_tensor(int tier) const { return tier < num_tiers_ ? tiers_[tier].residency_table_tensor() : nullptr; }
 
     // Combined residency table encoding (tier, slot) for multi-tier kernel:
-    //   value >= 0: tier 0, slot = value
-    //   value <  0: tier 1, slot = -value - 1
+    //   value >= 0:  tier 0, slot = value
+    //   value == -1: not resident
+    //   value <= -2: val = -value - 2; if val < tier1_slots → tier 1 slot=val;
+    //                else → tier 2 slot=val-tier1_slots
     // Must be called after all tiers are populated. Creates a combined table
     // in the given ggml context.
     struct ggml_tensor* combined_residency_table(struct ggml_context* ctx) const;

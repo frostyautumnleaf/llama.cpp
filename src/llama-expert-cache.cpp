@@ -431,12 +431,25 @@ struct ggml_tensor* llama_expert_cache::combined_residency_table(struct ggml_con
         }
     }
 
-    // Tier 1: encode as -slot - 1 (only if not already in tier 0)
+    // Tier 1: encode as -slot - 2 (only if not already in tier 0)
+    // Tier 2: encode as -(slot + tier1_slots) - 2 (only if not in tier 0 or 1)
+    // Kernel decodes: val = -enc - 2; if val < tier1_slots → tier 1, else tier 2
+    const int64_t tier1_slots = (num_tiers_ > 1) ? tiers_[1].slots() : 0;
+
     if (num_tiers_ > 1 && tiers_[1].valid()) {
         const int32_t* t1 = tiers_[1].residency_table();
         for (int64_t i = 0; i < n; ++i) {
             if (t1[i] >= 0 && data[i] < 0) {
-                data[i] = -t1[i] - 1;
+                data[i] = -t1[i] - 2;
+            }
+        }
+    }
+
+    if (num_tiers_ > 2 && tiers_[2].valid()) {
+        const int32_t* t2 = tiers_[2].residency_table();
+        for (int64_t i = 0; i < n; ++i) {
+            if (t2[i] >= 0 && data[i] < 0) {
+                data[i] = -(t2[i] + (int32_t)tier1_slots) - 2;
             }
         }
     }

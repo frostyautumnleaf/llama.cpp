@@ -1600,7 +1600,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         // in the graph context
 
         // For multi-tier, use the combined residency table that encodes (tier, slot)
-        // Tier 0: slot >= 0, Tier 1: slot = -value - 1
+        // Encoding: enc >= 0 → tier 0 slot=enc; enc == -1 → not resident;
+        // enc <= -2 → val=-enc-2; if val < tier1_slots → tier 1 slot=val;
+        // else → tier 2 slot=val-tier1_slots
         ggml_tensor * combined_res = expert_cache->combined_residency_table(ctx0);
         if (combined_res == nullptr) {
             combined_res = expert_cache->residency_table_tensor(0);
@@ -1610,12 +1612,23 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
                                      expert_cache->slot_tensor(0, ctx0, w),
                                      combined_res);
 
-        // Set tier 1 slot tensor for the CUDA kernel (if present)
+        // Set tier 1 slot tensor and slot count for the CUDA kernel
         if (expert_cache->num_tiers() > 1) {
             ggml_cuda_set_expert_cache_tier1_slot_tensor(
                 expert_cache->slot_tensor(1, ctx0, w));
+            ggml_cuda_set_expert_cache_tier1_slots(
+                (int)expert_cache->slots(1));
         } else {
             ggml_cuda_set_expert_cache_tier1_slot_tensor(nullptr);
+            ggml_cuda_set_expert_cache_tier1_slots(0);
+        }
+
+        // Set tier 2 slot tensor for the CUDA kernel (if present)
+        if (expert_cache->num_tiers() > 2) {
+            ggml_cuda_set_expert_cache_tier2_slot_tensor(
+                expert_cache->slot_tensor(2, ctx0, w));
+        } else {
+            ggml_cuda_set_expert_cache_tier2_slot_tensor(nullptr);
         }
     } else {
         res = ggml_mul_mat_id(ctx0, w, cur, ids);

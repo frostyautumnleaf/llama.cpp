@@ -452,6 +452,14 @@ extern "C" {
     // Must be called before graph execution. Pass nullptr to disable tier 1.
     GGML_API void ggml_cuda_set_expert_cache_tier1_slot_tensor(const struct ggml_tensor * tensor);
 
+    // Set the tier 2 (tertiary GPU) slot tensor for the cached MoE kernel.
+    // Must be called before graph execution. Pass nullptr to disable tier 2.
+    GGML_API void ggml_cuda_set_expert_cache_tier2_slot_tensor(const struct ggml_tensor * tensor);
+
+    // Set the tier 1 slot count. Used by the kernel to decode the residency table
+    // encoding for tier 1 vs tier 2. Must be called before graph execution.
+    GGML_API void ggml_cuda_set_expert_cache_tier1_slots(int slots);
+
 #ifdef  __cplusplus
 }
 #endif
