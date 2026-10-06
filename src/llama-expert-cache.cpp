@@ -411,6 +411,55 @@ struct ggml_tensor* llama_expert_cache::slot_tensor(int tier, struct ggml_contex
     return tiers_[tier].slot_tensor(graph_ctx, w);
 }
 
+int64_t llama_expert_cache::promote_tier_to(int src_tier, int dst_tier) {
+    if (src_tier < 0 || src_tier >= num_tiers_ || dst_tier < 0 || dst_tier >= num_tiers_) {
+        return 0;
+    }
+    if (src_tier == dst_tier) {
+        return 0;
+    }
+
+    int64_t copied = 0;
+    const int64_t n = n_layers() * n_expert();
+    const int32_t* src_table = tiers_[src_tier].residency_table();
+
+    // Iterate over all (layer, expert) pairs in the source tier
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t src_slot = src_table[i];
+        if (src_slot < 0) {
+            continue; // Not resident in source tier
+        }
+
+        // Decompose index into layer and expert
+        const int64_t layer = i / n_expert();
+        const int64_t expert = i % n_expert();
+
+        // Try to admit this expert to the destination tier
+        const int32_t dst_slot = tiers_[dst_tier].admit(layer, expert);
+        if (dst_slot < 0) {
+            continue; // Destination tier is full
+        }
+
+        // Copy the expert weights from source to destination
+        const void* src_data = tiers_[src_tier].device_slot(src_slot);
+        if (src_data == nullptr) {
+            continue;
+        }
+
+        std::string err;
+        if (!tiers_[dst_tier].fill_slot_blocking(dst_slot, src_data, err, blob_bytes())) {
+            continue;
+        }
+
+        // Remove from source tier by clearing its residency entry
+        // (we can't easily remove from the source tier's residency table,
+        //  so we just leave it; the combined table will prefer the dst tier)
+        ++copied;
+    }
+
+    return copied;
+}
+
 struct ggml_tensor* llama_expert_cache::combined_residency_table(struct ggml_context* ctx) const {
     if (num_tiers_ <= 0) return nullptr;
 

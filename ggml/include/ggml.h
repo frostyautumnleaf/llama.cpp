@@ -1510,13 +1510,19 @@ extern "C" {
     // ids: selected expert IDs [n_expert_used, n_tokens]
     // cached: cached expert weights [n_ff, n_embd, n_slots]
     // residency: residency table [n_expert] (I32, slot index or -1)
+    // cached1: tier 1 cached expert weights (optional, nullptr if not used)
+    // cached2: tier 2 cached expert weights (optional, nullptr if not used)
+    // tier1_slots: number of slots in tier 1 (for residency table decoding)
     GGML_API struct ggml_tensor * ggml_mul_mat_id_cached(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids,
             struct ggml_tensor  * cached,
-            struct ggml_tensor  * residency);
+            struct ggml_tensor  * residency,
+            struct ggml_tensor  * cached1,
+            struct ggml_tensor  * cached2,
+            int32_t              tier1_slots);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

@@ -460,6 +460,10 @@ extern "C" {
     // encoding for tier 1 vs tier 2. Must be called before graph execution.
     GGML_API void ggml_cuda_set_expert_cache_tier1_slots(int slots);
 
+    // Check if P2P access is available between two CUDA devices.
+    // Returns true if dev0 can directly access dev1's memory (or vice versa).
+    GGML_API bool ggml_cuda_peer_access_available(int dev0, int dev1);
+
 #ifdef  __cplusplus
 }
 #endif

@@ -3432,7 +3432,10 @@ struct ggml_tensor * ggml_mul_mat_id_cached(
         struct ggml_tensor  * b,
         struct ggml_tensor  * ids,
         struct ggml_tensor  * cached,
-        struct ggml_tensor  * residency) {
+        struct ggml_tensor  * residency,
+        struct ggml_tensor  * cached1,
+        struct ggml_tensor  * cached2,
+        int32_t              tier1_slots) {
     GGML_ASSERT(!ggml_is_transposed(as));
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
     GGML_ASSERT(residency->type == GGML_TYPE_I32);
@@ -3453,6 +3456,12 @@ struct ggml_tensor * ggml_mul_mat_id_cached(
     result->src[2] = ids;
     result->src[3] = cached;
     result->src[4] = residency;
+    result->src[5] = cached1;
+    result->src[6] = cached2;
+
+    // Store tier1_slots in op_params (first 4 bytes)
+    memset(result->op_params, 0, sizeof(result->op_params));
+    memcpy(result->op_params, &tier1_slots, sizeof(int32_t));
 
     return result;
 }
@@ -8213,4 +8222,18 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
 // Stub for non-CUDA builds; the real implementation is in ggml-cuda.cu
 void ggml_cuda_set_expert_cache_tier1_slot_tensor(const struct ggml_tensor * tensor) {
     (void)tensor;
+}
+
+void ggml_cuda_set_expert_cache_tier2_slot_tensor(const struct ggml_tensor * tensor) {
+    (void)tensor;
+}
+
+void ggml_cuda_set_expert_cache_tier1_slots(int slots) {
+    (void)slots;
+}
+
+bool ggml_cuda_peer_access_available(int dev0, int dev1) {
+    (void)dev0;
+    (void)dev1;
+    return true; // Assume P2P is available on non-CUDA builds
 }

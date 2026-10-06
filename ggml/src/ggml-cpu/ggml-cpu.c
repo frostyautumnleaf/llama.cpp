@@ -1747,8 +1747,14 @@ static void ggml_compute_forward_mul_mat_id_cached(
     const struct ggml_tensor * src0   = dst->src[0]; // original expert weights [n_ff, n_embd, n_expert]
     const struct ggml_tensor * src1   = dst->src[1]; // input [n_embd, 1, n_tokens]
     const struct ggml_tensor * ids    = dst->src[2]; // selected expert IDs [n_expert_used, n_tokens]
-    const struct ggml_tensor * cached = dst->src[3]; // cached expert weights [n_ff, n_embd, n_slots]
-    const struct ggml_tensor * residency = dst->src[4]; // residency table [n_expert] (I32, slot or -1)
+    const struct ggml_tensor * cached = dst->src[3]; // tier 0 cached expert weights [n_ff, n_embd, n_slots]
+    const struct ggml_tensor * residency = dst->src[4]; // residency table [n_expert] (I32, encoded tier/slot)
+    const struct ggml_tensor * cached1 = dst->src[5]; // tier 1 cached expert weights (optional)
+    const struct ggml_tensor * cached2 = dst->src[6]; // tier 2 cached expert weights (optional)
+
+    // Read tier1_slots from op_params (first 4 bytes)
+    int32_t tier1_slots = 0;
+    memcpy(&tier1_slots, dst->op_params, sizeof(int32_t));
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1843,8 +1849,6 @@ static void ggml_compute_forward_mul_mat_id_cached(
 
     ggml_barrier(params->threadpool);
 
-    const enum ggml_type type_cached = cached->type;
-
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1852,15 +1856,44 @@ static void ggml_compute_forward_mul_mat_id_cached(
             continue;
         }
 
-        // Check if this expert is resident in the cache
-        const int32_t slot = *(const int32_t *) ((const char *) residency->data + cur_a*residency->nb[0]);
-        const bool resident = (slot >= 0);
+        // Check if this expert is resident in the cache (multi-tier)
+        // Encoding: enc >= 0 → tier 0 slot=enc; enc == -1 → not resident;
+        // enc <= -2 → val=-enc-2; if val < tier1_slots → tier 1 slot=val;
+        // else → tier 2 slot=val-tier1_slots
+        const int32_t enc = *(const int32_t *) ((const char *) residency->data + cur_a*residency->nb[0]);
 
         // Get the appropriate weights pointer
         const char * src0_cur;
-        if (resident) {
-            // Use cached weights
-            src0_cur = (const char *) cached->data + slot * cached->nb[2];
+        const char * cached_cur = NULL;
+        size_t cached_nb1 = 0; // row stride for cached weights
+        enum ggml_type cached_type = GGML_TYPE_F32;
+        bool use_cached = false;
+
+        if (enc >= 0) {
+            // Tier 0: main cache
+            use_cached = true;
+            cached_cur = (const char *) cached->data + enc * cached->nb[2];
+            cached_nb1 = cached->nb[1];
+            cached_type = cached->type;
+        } else if (enc <= -2) {
+            const int32_t val = -enc - 2;
+            if (val < tier1_slots && cached1 != NULL) {
+                // Tier 1
+                use_cached = true;
+                cached_cur = (const char *) cached1->data + val * cached1->nb[2];
+                cached_nb1 = cached1->nb[1];
+                cached_type = cached1->type;
+            } else if (val >= tier1_slots && cached2 != NULL) {
+                // Tier 2
+                use_cached = true;
+                cached_cur = (const char *) cached2->data + (val - tier1_slots) * cached2->nb[2];
+                cached_nb1 = cached2->nb[1];
+                cached_type = cached2->type;
+            }
+        }
+
+        if (use_cached) {
+            src0_cur = cached_cur;
         } else {
             // Use original weights
             src0_cur = (const char *) src0->data + cur_a * nb02;
@@ -1889,15 +1922,14 @@ static void ggml_compute_forward_mul_mat_id_cached(
             for (int64_t ir0 = 0; ir0 < nr0; ++ir0) {
                 float sum = 0.0f;
                 const float * src1_row = (const float *) src1_col;
-                if (resident) {
-                    // Cached weights are typically F16 or F32
-                    if (type_cached == GGML_TYPE_F32) {
-                        const float * w = (const float *) (src0_cur + ir0 * cached->nb[1]);
+                if (use_cached) {
+                    if (cached_type == GGML_TYPE_F32) {
+                        const float * w = (const float *) (src0_cur + ir0 * cached_nb1);
                         for (int64_t i = 0; i < ne00; ++i) {
                             sum += w[i] * src1_row[i];
                         }
-                    } else if (type_cached == GGML_TYPE_F16) {
-                        const ggml_fp16_t * w = (const ggml_fp16_t *) (src0_cur + ir0 * cached->nb[1]);
+                    } else if (cached_type == GGML_TYPE_F16) {
+                        const ggml_fp16_t * w = (const ggml_fp16_t *) (src0_cur + ir0 * cached_nb1);
                         for (int64_t i = 0; i < ne00; ++i) {
                             sum += ggml_fp16_to_fp32(w[i]) * src1_row[i];
                         }

@@ -1608,28 +1608,26 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             combined_res = expert_cache->residency_table_tensor(0);
         }
 
-        res = ggml_mul_mat_id_cached(ctx0, w, cur, ids,
-                                     expert_cache->slot_tensor(0, ctx0, w),
-                                     combined_res);
+        // Pass tier slot tensors directly to the operation (thread-safe)
+        ggml_tensor * tier0_slots = expert_cache->slot_tensor(0, ctx0, w);
+        ggml_tensor * tier1_slots_tensor = nullptr;
+        ggml_tensor * tier2_slots_tensor = nullptr;
+        int32_t tier1_slot_count = 0;
 
-        // Set tier 1 slot tensor and slot count for the CUDA kernel
         if (expert_cache->num_tiers() > 1) {
-            ggml_cuda_set_expert_cache_tier1_slot_tensor(
-                expert_cache->slot_tensor(1, ctx0, w));
-            ggml_cuda_set_expert_cache_tier1_slots(
-                (int)expert_cache->slots(1));
-        } else {
-            ggml_cuda_set_expert_cache_tier1_slot_tensor(nullptr);
-            ggml_cuda_set_expert_cache_tier1_slots(0);
+            tier1_slots_tensor = expert_cache->slot_tensor(1, ctx0, w);
+            tier1_slot_count = (int32_t)expert_cache->slots(1);
+        }
+        if (expert_cache->num_tiers() > 2) {
+            tier2_slots_tensor = expert_cache->slot_tensor(2, ctx0, w);
         }
 
-        // Set tier 2 slot tensor for the CUDA kernel (if present)
-        if (expert_cache->num_tiers() > 2) {
-            ggml_cuda_set_expert_cache_tier2_slot_tensor(
-                expert_cache->slot_tensor(2, ctx0, w));
-        } else {
-            ggml_cuda_set_expert_cache_tier2_slot_tensor(nullptr);
-        }
+        res = ggml_mul_mat_id_cached(ctx0, w, cur, ids,
+                                     tier0_slots,
+                                     combined_res,
+                                     tier1_slots_tensor,
+                                     tier2_slots_tensor,
+                                     tier1_slot_count);
     } else {
         res = ggml_mul_mat_id(ctx0, w, cur, ids);
     }

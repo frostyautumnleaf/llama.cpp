@@ -2025,12 +2025,30 @@ void ggml_cuda_set_expert_cache_tier1_slots(int slots) {
     g_expert_cache_tier1_slots = slots;
 }
 
+bool ggml_cuda_peer_access_available(int dev0, int dev1) {
+    if (dev0 == dev1) return true;
+    int can_access = 0;
+    cudaError_t err = cudaDeviceCanAccessPeer(&can_access, dev0, dev1);
+    if (err != cudaSuccess) return false;
+    if (can_access) return true;
+    // Check reverse direction
+    err = cudaDeviceCanAccessPeer(&can_access, dev1, dev0);
+    if (err != cudaSuccess) return false;
+    return can_access != 0;
+}
+
 static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0      = dst->src[0]; // original expert weights [n_ff, n_embd, n_expert]
     const ggml_tensor * src1      = dst->src[1]; // input [n_embd, 1, n_tokens]
     const ggml_tensor * ids       = dst->src[2]; // selected expert IDs [n_expert_used, n_tokens]
     const ggml_tensor * cached    = dst->src[3]; // tier 0 cached expert weights [n_ff, n_embd, n_slots]
     const ggml_tensor * residency = dst->src[4]; // residency table [n_expert] (I32, encoded tier/slot)
+    const ggml_tensor * cached1   = dst->src[5]; // tier 1 cached expert weights (optional)
+    const ggml_tensor * cached2   = dst->src[6]; // tier 2 cached expert weights (optional)
+
+    // Read tier1_slots from op_params (first 4 bytes)
+    int32_t tier1_slots = 0;
+    memcpy(&tier1_slots, dst->op_params, sizeof(int32_t));
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -2132,15 +2150,15 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
             weights_nb2 = cached->nb[2];
         } else if (enc <= -2) {
             const int32_t val = -enc - 2;
-            if (val < g_expert_cache_tier1_slots && g_expert_cache_tier1_slot_tensor != nullptr) {
+            if (val < tier1_slots && cached1 != nullptr) {
                 // Tier 1: secondary GPU cache
-                weights_src = g_expert_cache_tier1_slot_tensor;
+                weights_src = cached1;
                 weights_idx = val;
                 weights_nb2 = weights_src->nb[2];
-            } else if (val >= g_expert_cache_tier1_slots && g_expert_cache_tier2_slot_tensor != nullptr) {
+            } else if (val >= tier1_slots && cached2 != nullptr) {
                 // Tier 2: tertiary GPU cache
-                weights_src = g_expert_cache_tier2_slot_tensor;
-                weights_idx = val - g_expert_cache_tier1_slots;
+                weights_src = cached2;
+                weights_idx = val - tier1_slots;
                 weights_nb2 = weights_src->nb[2];
             }
         }

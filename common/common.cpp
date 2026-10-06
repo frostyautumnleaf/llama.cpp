@@ -1377,6 +1377,23 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                         }
                     }
 
+                    // P2P fallback: if a tier's GPU cannot P2P-access the main GPU,
+                    // promote its experts to tier 0 (copy weights to main GPU's cache).
+                    // Experts that don't fit in tier 0 fall back to original weights.
+                    if (cache.num_tiers() > 1) {
+                        for (int t = 1; t < cache.num_tiers(); ++t) {
+                            if (!ggml_cuda_peer_access_available(0, t)) {
+                                LOG_WRN("expert cache: no P2P access between GPU 0 and GPU %d, "
+                                        "promoting tier %d experts to tier 0\n", t, t);
+                                int64_t promoted = cache.promote_tier_to(t, 0);
+                                int64_t remaining = cache.resident(t);
+                                LOG_INF("expert cache: promoted %lld experts from tier %d to tier 0, "
+                                        "%lld remain in tier %d (will fall back to original weights)\n",
+                                        (long long)promoted, t, (long long)remaining, t);
+                            }
+                        }
+                    }
+
                     // Store the cache in the model
                     model_int->expert_cache = std::make_unique<llama_expert_cache>(std::move(cache));
                     LOG_INF("expert cache: initialized with %d tiers, %lld total resident experts\n",

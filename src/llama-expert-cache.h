@@ -170,6 +170,11 @@ public:
     // Get tier's slot tensor
     struct ggml_tensor* slot_tensor(int tier, struct ggml_context* graph_ctx, const ggml_tensor* w = nullptr) const;
 
+    // Copy experts from a source tier to a destination tier (for P2P fallback).
+    // Experts that can't fit in the destination tier remain in the source tier.
+    // Returns the number of experts copied.
+    int64_t promote_tier_to(int src_tier, int dst_tier);
+
     int64_t n_layers() const { return tiers_[0].n_layers(); }
     int64_t n_expert() const { return tiers_[0].n_expert(); }
     int64_t blob_bytes() const { return tiers_[0].blob_bytes(); }
