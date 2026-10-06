@@ -1279,16 +1279,37 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->model.reset(model);
 
-    // Initialize the adaptive VRAM expert tier if requested
-    // Note: this uses the internal model API, so it's only available when building
-    // with the full llama library (not just the public API)
+    // The expert cache and the KV streaming window are ported on this branch but are not functional; see
+    // docs/strata-port-status.md. They are accepted and ignored rather than acted on, because acting on them
+    // is fatal:
+    //
+    //   - the arena is allocated with ggml_new_tensor_1d on a host ggml_context, so it is plain RAM. Nothing
+    //     puts it on a GPU, which is the whole point of the tier. Handing it to mul_mat_id as a weight tensor
+    //     makes the backend stage the host buffer on every MoE layer.
+    //   - one arena is shared by every MoE projection, but each projection is its own MUL_MAT_ID_CACHED with
+    //     its own shape, and the slot is sized from ffn_gate_exps alone while the copy writes gate+up+down.
+    //   - the residency table is written through a tensor made on the graph context, which is no_alloc, so its
+    //     data pointer is null: enabling the cache segfaults on the first graph build.
+    //   - --kv-resident streams K into the V window, so attention reads values the model never wrote.
+    if (params.expert_cache_slots > 0 || params.expert_cache_secondary_slots > 0
+            || params.expert_cache_tertiary_slots > 0 || params.expert_prefetch_slots > 0
+            || params.expert_adapt || !params.expert_profile.empty() || params.kv_resident > 0) {
+        LOG_WRN("the Strata expert cache (--expert-cache[-secondary|-tertiary], --expert-adapt, "
+                "--expert-prefetch, --expert-profile) and KV streaming (--kv-resident) are ported but not "
+                "functional on this branch, and are being ignored - see docs/strata-port-status.md.\n");
+        LOG_WRN("working Strata ports on this branch: --spec-type ngram-suffix, optionally with "
+                "--spec-ngram-suffix-refined, and the flat prompt-lookup caches\n");
+    }
+
+    // The blocks below stay in the tree as the starting point for the real port, guarded so none of them can
+    // run while the check above stands.
     //
     // Multi-GPU tiers (Strata's "second GPU as another expert tier"):
     //   Tier 0: main GPU (--expert-cache N)
     //   Tier 1: second GPU (--expert-cache-secondary N)
     //   Tier 2: third GPU (--expert-cache-tertiary N)
     // Experts are admitted to tier 0 first, then tier 1, then tier 2.
-    if (params.expert_cache_slots > 0) {
+    if (false && params.expert_cache_slots > 0) {
         // Access the internal model structure to get expert information
         llama_model * model_int = reinterpret_cast<llama_model *>(model);
         const auto & hparams = model_int->hparams;
@@ -1580,7 +1601,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl->context.reset(lctx);
 
     // Initialize KV streaming if requested
-    if (params.kv_resident > 0) {
+    if (false && params.kv_resident > 0) {
         // Access the internal context to get the KV cache
         llama_context * lctx_int = reinterpret_cast<llama_context *>(lctx);
         llama_memory_t mem = lctx_int->get_memory();
