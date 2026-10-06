@@ -509,6 +509,7 @@ struct common_params {
     bool expert_adapt = false;          // enable runtime adaptation
     int32_t expert_adapt_interval = 32; // adapt every N tokens
     int32_t expert_adapt_max_moves = 16; // max experts to move per pass
+    int32_t expert_prefetch_slots = 0;  // number of prefetch slots (0 = disabled)
 
     // KV streaming (Strata's resident window)
     // When set, the full KV cache is stored in RAM and only N entries are kept

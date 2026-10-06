@@ -2856,6 +2856,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_ADAPT_MAX_MOVES"));
     add_opt(common_arg(
+        {"--expert-prefetch"}, "N",
+        "number of prefetch slots for experts (0 = disabled; requires --expert-cache-secondary; "
+        "copies recently-used experts to tier 1 ahead of time to hide load latency)",
+        [](common_params & params, const std::string & value) {
+            params.expert_prefetch_slots = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_EXPERT_PREFETCH"));
+    add_opt(common_arg(
         {"--kv-resident"}, "N",
         "number of KV entries to keep resident in VRAM (0 = disabled, all in VRAM; "
         "full KV cache stored in RAM, needed entries streamed to VRAM before attention)",

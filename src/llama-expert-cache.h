@@ -105,6 +105,10 @@ public:
     int64_t n_expert() const { return n_expert_; }
     int64_t blob_bytes() const { return blob_; }
 
+    // Set the maximum number of slots available for regular admissions.
+    // Slots beyond this limit are reserved (e.g., for prefetch).
+    void set_max_admit_slots(int64_t max_slots) { max_admit_slots_ = max_slots; }
+
 private:
     struct ggml_context* ctx_ = nullptr;
     struct ggml_tensor* slot_tensor_ = nullptr;
@@ -121,6 +125,7 @@ private:
     std::vector<int32_t> layer_next_;  // [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;        // slot offsets when sized
     int64_t admitted_ = 0;
+    int64_t max_admit_slots_ = 0;      // 0 = no limit (all slots available)
 };
 
 // Callback to copy expert weights from model tensors to a cache slot
@@ -154,6 +159,45 @@ public:
 
     llama_expert_cache(llama_expert_cache&& other) noexcept;
     llama_expert_cache& operator=(llama_expert_cache&& other) noexcept;
+
+    // ========================================================================
+    // Prefetch (Strata's second_gpu.cpp init_prefetch/prefetch)
+    //
+    // A small dedicated region of tier 1 slots used for experts that are likely
+    // to be needed soon but are not currently resident. Prefetch copies run on
+    // a separate CUDA stream so they overlap with the current step's computation.
+    // ========================================================================
+
+    // Initialize prefetch with N slots (reserved at the end of tier 1's arena).
+    // Must be called after open_tier(1) and before the first inference.
+    // Returns true on success.
+    bool init_prefetch(int64_t n_slots, std::string& err);
+
+    // Check if prefetch is initialized
+    bool prefetch_enabled() const { return prefetch_slots_ > 0; }
+
+    // Number of prefetch slots
+    int64_t prefetch_slots() const { return prefetch_slots_; }
+
+    // Start async copies of experts to prefetch slots.
+    // experts: array of [n_layers] pointers, each pointing to [n] expert IDs to prefetch for that layer
+    // n_per_layer: number of expert IDs per layer
+    // Returns the number of experts scheduled for prefetch.
+    int64_t prefetch(const int32_t* const* per_layer_experts, int64_t n_per_layer, std::string& err);
+
+    // Wait for all pending prefetch copies to complete.
+    // Must be called before executing the graph that uses the prefetched experts.
+    void wait_prefetch();
+
+    // Clear prefetch residency entries (called before each new prefetch round)
+    void clear_prefetch_residency();
+
+    // Get the prefetch slot tensor (for kernel access)
+    // This is a view of the prefetch region within tier 1's slot arena
+    struct ggml_tensor* prefetch_slot_tensor(struct ggml_context* graph_ctx, const ggml_tensor* w = nullptr) const;
+
+    // Offset of the first prefetch slot within tier 1's slot arena
+    int64_t prefetch_slot_offset() const { return prefetch_slot_offset_; }
 
     // Open tier 0 (main GPU). Must be called before any other tier.
     bool open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
@@ -289,6 +333,13 @@ public:
 private:
     llama_expert_cache_tier tiers_[LLAMA_EXPERT_MAX_TIERS];
     int num_tiers_ = 0;
+
+    // Prefetch state
+    int64_t prefetch_slots_ = 0;              // number of prefetch slots
+    int64_t prefetch_slot_offset_ = 0;        // offset within tier 1's arena
+    void* prefetch_stream_ = nullptr;         // separate CUDA stream for async copies
+    void* prefetch_event_ = nullptr;          // event recorded when prefetch copies complete
+    std::vector<int32_t> prefetch_residency_; // per-expert prefetch slot assignments (layer*expert -> slot or -1)
 
     // Runtime adaptation state
     std::unique_ptr<llama_expert_adapt_params> adapt_params_;

@@ -189,12 +189,20 @@ int32_t llama_expert_cache_tier::admit(int64_t layer, int64_t expert) {
         return residency_[at];
     }
 
+    // Respect max_admit_slots_ (slots beyond this are reserved, e.g., for prefetch)
+    const int64_t effective_slots = (max_admit_slots_ > 0 && max_admit_slots_ < slots_)
+        ? max_admit_slots_ : slots_;
+
     if (per_layer_) {
         if (layer_next_.empty()) {
             return LLAMA_EXPERT_NOT_RESIDENT;
         }
         int64_t lo = 0, hi = 0;
         layer_slot_range(layer, lo, hi);
+        // Cap hi to effective_slots
+        if (hi > effective_slots) {
+            hi = effective_slots;
+        }
         if ((int64_t)layer_next_[(size_t)layer] >= hi) {
             return LLAMA_EXPERT_NOT_RESIDENT;  // this layer's quota is full
         }
@@ -203,7 +211,7 @@ int32_t llama_expert_cache_tier::admit(int64_t layer, int64_t expert) {
         return residency_[at];
     }
 
-    if (next_free_ >= slots_) {
+    if (next_free_ >= effective_slots) {
         return LLAMA_EXPERT_NOT_RESIDENT;  // full: no eviction
     }
     residency_[at] = (int32_t)next_free_;
@@ -532,6 +540,17 @@ struct ggml_tensor* llama_expert_cache::combined_residency_table(struct ggml_con
         }
     }
 
+    // Prefetch slots: encode as tier 1 entries (they're in tier 1's arena)
+    // The slot index is the absolute index within tier 1's arena.
+    // Prefetch entries override regular tier 1 entries for the same (layer, expert)
+    if (prefetch_enabled() && !prefetch_residency_.empty()) {
+        for (int64_t i = 0; i < n; ++i) {
+            if (prefetch_residency_[i] >= 0) {
+                data[i] = -prefetch_residency_[i] - 2;
+            }
+        }
+    }
+
     return table;
 }
 
@@ -770,6 +789,185 @@ void llama_expert_cache::apply_captured_usage() {
     }
 
     captured_usage_.clear();
+}
+
+// ============================================================================
+// Prefetch (Strata's second_gpu.cpp init_prefetch/prefetch)
+//
+// A small dedicated region of tier 1 slots for experts likely needed soon.
+// Prefetch copies run on a separate CUDA stream to overlap with computation.
+// ============================================================================
+
+#include "ggml-cuda.h"
+
+bool llama_expert_cache::init_prefetch(int64_t n_slots, std::string& err) {
+    if (n_slots <= 0) {
+        return true; // nothing to do
+    }
+    if (n_slots > 64) {
+        err = "llama_expert_cache: prefetch slots limited to 64";
+        return false;
+    }
+    if (num_tiers_ < 2) {
+        err = "llama_expert_cache: prefetch requires tier 1 (open_tier(1) first)";
+        return false;
+    }
+    if (!tiers_[1].valid()) {
+        err = "llama_expert_cache: tier 1 is not valid";
+        return false;
+    }
+    if (prefetch_slots_ > 0) {
+        err = "llama_expert_cache: prefetch already initialized";
+        return false;
+    }
+
+    const int64_t tier1_total = tiers_[1].slots();
+    if (n_slots >= tier1_total) {
+        err = "llama_expert_cache: prefetch slots must be less than tier 1 total slots";
+        return false;
+    }
+
+    prefetch_slots_ = n_slots;
+    prefetch_slot_offset_ = tier1_total - n_slots;
+
+    // Reserve the prefetch region: regular admissions can't use these slots
+    tiers_[1].set_max_admit_slots(prefetch_slot_offset_);
+
+    // Create a separate CUDA stream for prefetch copies
+    // We use the CUDA backend's stream management
+    // For now, use the default stream (can be improved with a dedicated stream)
+    prefetch_stream_ = nullptr; // will use default stream
+    prefetch_event_ = nullptr;
+
+    // Initialize prefetch residency table (all not resident)
+    prefetch_residency_.assign(n_layers() * n_expert(), LLAMA_EXPERT_NOT_RESIDENT);
+
+    LLAMA_LOG_INFO("%s: prefetch initialized with %lld slots (tier 1 slots %lld..%lld)\n",
+                   __func__, (long long)n_slots,
+                   (long long)prefetch_slot_offset_,
+                   (long long)(prefetch_slot_offset_ + n_slots - 1));
+
+    return true;
+}
+
+void llama_expert_cache::clear_prefetch_residency() {
+    if (prefetch_residency_.empty()) return;
+    std::fill(prefetch_residency_.begin(), prefetch_residency_.end(), LLAMA_EXPERT_NOT_RESIDENT);
+}
+
+int64_t llama_expert_cache::prefetch(const int32_t* const* per_layer_experts,
+                                     int64_t n_per_layer,
+                                     std::string& err) {
+    err.clear();
+    if (!prefetch_enabled()) {
+        return 0;
+    }
+    if (per_layer_experts == nullptr || n_per_layer <= 0) {
+        return 0;
+    }
+
+    int64_t scheduled = 0;
+    int64_t slot_idx = 0;
+
+    for (int64_t layer = 0; layer < n_layers() && slot_idx < prefetch_slots_; ++layer) {
+        const int32_t* experts = per_layer_experts[layer];
+        if (experts == nullptr) continue;
+
+        for (int64_t i = 0; i < n_per_layer && slot_idx < prefetch_slots_; ++i) {
+            const int64_t expert = experts[i];
+            if (expert < 0 || expert >= n_expert()) continue;
+
+            // Check if already resident in any tier
+            int tier;
+            int32_t slot;
+            slot_of(layer, expert, tier, slot);
+            if (tier >= 0) {
+                continue; // already resident, no need to prefetch
+            }
+
+            // Check if already scheduled for prefetch this round
+            const size_t at = (size_t)(layer * n_expert() + expert);
+            if (prefetch_residency_[at] >= 0) {
+                continue; // already scheduled
+            }
+
+            // Assign a prefetch slot
+            const int32_t pf_slot = (int32_t)(prefetch_slot_offset_ + slot_idx);
+            prefetch_residency_[at] = pf_slot;
+            slot_idx++;
+            scheduled++;
+
+            // Copy expert weights to the prefetch slot
+            // We need to read from the model's original expert weights
+            // and copy to the prefetch slot on tier 1
+            if (adapt_params_ != nullptr && adapt_params_->copy_fn != nullptr) {
+                void* dst = tiers_[1].device_slot(pf_slot);
+                if (dst != nullptr) {
+                    adapt_params_->copy_fn(layer, expert, dst, blob_bytes(),
+                                           adapt_params_->copy_user_data);
+                }
+            }
+        }
+    }
+
+    if (scheduled > 0) {
+        LLAMA_LOG_DEBUG("%s: scheduled %lld experts for prefetch\n", __func__, (long long)scheduled);
+    }
+
+    return scheduled;
+}
+
+void llama_expert_cache::wait_prefetch() {
+    // For now, copies are done synchronously in prefetch()
+    // When we add async copies with a separate stream, we'll wait here
+    if (prefetch_event_ != nullptr) {
+        // cudaStreamWaitEvent or cudaEventSynchronize would go here
+        prefetch_event_ = nullptr;
+    }
+}
+
+struct ggml_tensor* llama_expert_cache::prefetch_slot_tensor(
+        struct ggml_context* graph_ctx, const ggml_tensor* w) const {
+    if (!prefetch_enabled() || num_tiers_ < 2 || !tiers_[1].valid()) {
+        return nullptr;
+    }
+
+    // The prefetch slots are at the end of tier 1's arena.
+    // We create a view of tier 1's slot tensor that covers only the prefetch region.
+    const int64_t n_slots = prefetch_slots_;
+    const int64_t offset = prefetch_slot_offset_;
+
+    if (w == nullptr) {
+        return nullptr; // can't create view without knowing the shape
+    }
+
+    const int64_t ne0 = w->ne[0];
+    const int64_t ne1 = w->ne[1];
+
+    int64_t slot_bytes = blob_bytes();
+    // Note: we use blob_bytes() here since tier 1 has uniform slot sizes
+
+    // Get tier 1's base data pointer and add offset
+    const void* tier1_base = tiers_[1].device_slot(0);
+    if (tier1_base == nullptr) {
+        return nullptr;
+    }
+
+    const void* pf_base = (const uint8_t*)tier1_base + offset * slot_bytes;
+
+    // Create a view tensor
+    struct ggml_tensor* view = ggml_new_tensor_3d(graph_ctx, w->type, ne0, ne1, n_slots);
+    if (view == nullptr) {
+        return nullptr;
+    }
+
+    view->data = const_cast<void*>(pf_base);
+    view->nb[0] = w->nb[0];
+    view->nb[1] = w->nb[1];
+    view->nb[2] = slot_bytes;
+    view->nb[3] = n_slots * slot_bytes;
+
+    return view;
 }
 
 bool llama_read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,

@@ -1464,6 +1464,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                             LOG_WRN("expert cache: failed to enable adaptation: %s\n", adapt_err.c_str());
                         }
                     }
+
+                    // Initialize prefetch if requested
+                    if (params.expert_prefetch_slots > 0) {
+                        if (model_int->expert_cache->num_tiers() < 2) {
+                            LOG_WRN("expert cache: prefetch requires --expert-cache-secondary, ignoring\n");
+                        } else {
+                            std::string pf_err;
+                            if (model_int->expert_cache->init_prefetch(params.expert_prefetch_slots, pf_err)) {
+                                LOG_INF("expert cache: prefetch enabled with %d slots\n",
+                                        params.expert_prefetch_slots);
+                            } else {
+                                LOG_WRN("expert cache: failed to initialize prefetch: %s\n", pf_err.c_str());
+                            }
+                        }
+                    }
                 }
             }
         } else {
