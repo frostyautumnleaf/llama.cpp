@@ -2835,9 +2835,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_PROFILE"));
     add_opt(common_arg(
-        {"--expert-adapt"}, "",
+        {"--expert-adapt"},
         "enable runtime expert cache adaptation (admit/evict based on routing usage)",
-        [](common_params & params, const std::string &) {
+        [](common_params & params) {
             params.expert_adapt = true;
         }
     ).set_env("LLAMA_ARG_EXPERT_ADAPT"));
