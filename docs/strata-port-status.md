@@ -1,6 +1,45 @@
 # Strata port on `3x` - what works, what does not
 
-Measured on this branch against `master` (cb7934c52) and Strata's own sources.
+Measured on this branch against upstream `master` (now `c479922ac`, build 11481; the port itself was written
+against `cb7934c52`, build 11389) and Strata's own sources.
+
+## Upstream sync - 2026-10-07
+
+`3x` rebased onto `upstream/master` = `c479922ac` (llama.cpp 0.6.0 / ggml 0.26.0) from `cb7934c52`: 85 upstream
+commits in, the 23 port commits replayed on top. Everything stays on the fork - no upstream PR, and `upstream`
+is configured with a disabled push URL so none can be opened by accident.
+
+Two conflicts, both "both sides added something at the same place":
+
+- `tests/test-llama-archs.cpp` - upstream added a `tensor_buft_overrides` parameter to `get_model_and_ctx` and a
+  "Mixed batch" column (`6753a033f`, `0bb496dbd`); the port had added `load_mtp`/`n_rs_seq` and an "MTP draft"
+  column. Both kept: `tensor_buft_overrides` stays in its upstream position so upstream's call sites are
+  untouched, the port's parameters follow it, and the port's two call sites pass `nullptr` for overrides
+  explicitly. The table separator now matches all six columns.
+- `src/llama-graph.h` - upstream's `crop_before_nextn`/`crop_after_nextn` helpers (`f0c41e016`) and the port's
+  `record_expert_usage` were both inserted just after `cb()`. Both kept.
+
+Nothing else conflicted, and the port's net delta against upstream is unchanged by the sync apart from those two
+files (in `llama-graph.h` only the diff's context lines moved) - checked by diffing `git diff <base>..3x` before
+and after. Two upstream changes compose with the port rather than fighting it: the nextn-cropping helpers test
+`inp_out_ids != nullptr`, so the port's `inp_out_ids = n_outputs > 0 ? build_inp_out_ids() : nullptr` in
+`qwen4exp.cpp` still means "no output rows"; and `8330e9696`'s fix for n-gram drafts truncated at temp > 0 is
+intact in `common_speculative_draft` next to the `ngram-suffix` implementation.
+
+Verified after the sync, CPU-only (the GPUs are busy and were not touched): the CPU build and the `ggml-cuda`
+target both compile with 0 errors and 0 warnings; `ctest` passes 63/63 (all but `test-jinja-py`, which needs a
+python env); `test-mtp-draft-qwen4exp` passes and reports "MTP draft" OK alongside upstream's "Mixed batch";
+the port suites (`test-ngram-cache`, `test-ngram-suffix`, `test-spec-controller`, `test-spec-suffix`,
+`test-mul-mat-id-cached`) pass; the synthetic `qwen4exp` fixture loads and generates with `--spec-type
+`draft-mtp`, `ngram-suffix` and `draft-mtp,ngram-suffix`; and the inert Strata arguments still warn once and get
+ignored, with the server starting normally.
+
+Two upstream changes are directly useful to the port work that is still open (defects 1-5 below):
+
+- `c712b36cf llama : llama_prefetch_rows` - a public row-prefetch API. The tier-1 expert prefetch (`522c66e36`)
+  should be rebuilt on it instead of keeping its own copy loop.
+- `6753a033f ggml: refactor selective expert copying to user code` - the scheduler now copies a split's host
+  weights through a user callback, which is the natural place to fill cache slots.
 
 ## Working, and verified
 
