@@ -2,6 +2,7 @@
 #include "clip-impl.h"
 #include "mtmd.h"
 #include "mtmd-internal.h"
+#include "mtmd-remote.h"
 #include "mtmd-audio.h"
 #include "mtmd-image.h"
 #include "debug/mtmd-debug.h"
@@ -472,6 +473,8 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* remote_mmproj_url   */ nullptr,
+        /* remote_mmproj_timeout_ms */ 300000,
     };
     return params;
 }
@@ -525,6 +528,13 @@ struct mtmd_context {
     // batching
     int32_t batch_max_tokens;
 
+    // remote mmproj: when set, vision batches are encoded by a mmproj-processing-server
+    // reachable over the LAN instead of by the local clip context (see mtmd-remote.h)
+    bool                 remote_enabled    = false;
+    bool                 remote_warned_aud = false;
+    mtmd_remote::url     remote_url;
+    int                  remote_timeout_ms = 300000;
+
     // TODO @ngxson : add timings
 
     mtmd_context(const char * mmproj_fname,
@@ -544,6 +554,22 @@ struct mtmd_context {
 
         if (media_marker.empty()) {
             throw std::runtime_error("media_marker must not be empty");
+        }
+
+        // parse the remote mmproj URL up-front: it changes how the clip context is created below
+        if (ctx_params.remote_mmproj_url != nullptr && ctx_params.remote_mmproj_url[0] != '\0') {
+            std::string url_err;
+            if (!mtmd_remote::url::parse(ctx_params.remote_mmproj_url, remote_url, url_err)) {
+                throw std::runtime_error(string_format("invalid remote mmproj URL '%s': %s\n",
+                                                       ctx_params.remote_mmproj_url, url_err.c_str()));
+            }
+            remote_enabled    = true;
+            remote_timeout_ms = ctx_params.remote_mmproj_timeout_ms > 0 ? ctx_params.remote_mmproj_timeout_ms : 300000;
+            if (!no_alloc) {
+                LOG_INF("%s: routing mmproj vision encoding to remote server %s://%s:%d%s\n",
+                        __func__, remote_url.scheme.c_str(), remote_url.host.c_str(), remote_url.port,
+                        remote_url.path.c_str());
+            }
         }
 
         if (text_model) {
@@ -571,7 +597,8 @@ struct mtmd_context {
             /* flash_attn_type   */ mtmd_get_clip_flash_attn_type(ctx_params.flash_attn_type),
             /* image_min_tokens  */ ctx_params.image_min_tokens,
             /* image_max_tokens  */ ctx_params.image_max_tokens,
-            /* warmup            */ ctx_params.warmup,
+            // no point warming up a vision encoder whose output we are never going to use locally
+            /* warmup            */ ctx_params.warmup && !remote_enabled,
             /* cb_eval           */ ctx_params.cb_eval,
             /* cb_eval_user_data */ ctx_params.cb_eval_user_data,
             /* no_alloc          */ no_alloc,
@@ -616,12 +643,61 @@ struct mtmd_context {
                     n_embd_text, n_embd_gen));
             }
         }
+        if (remote_enabled) {
+            if (!ctx_v) {
+                throw std::runtime_error("remote mmproj URL was given, but this mmproj has no vision encoder\n");
+            }
+            // skip the network round trip when we are only probing memory usage
+            if (!no_alloc) {
+                remote_handshake(n_embd_clip);
+            }
+        }
         if (ctx_v) {
             init_vision();
         }
         if (ctx_a) {
             init_audio();
         }
+    }
+
+    // ask the remote mmproj server what it is serving and refuse to run if it does not match
+    // the mmproj llama.cpp is using, otherwise we would silently feed the LLM embeddings of a
+    // completely different vision model
+    void remote_handshake(int n_embd_expected) {
+        std::string err;
+        mtmd_remote::response res;
+        if (!mtmd_remote::request(remote_url, "GET", remote_url.path + "/v1/info", {}, nullptr,
+                                  remote_timeout_ms, res, err)) {
+            throw std::runtime_error(string_format(
+                "failed to contact the remote mmproj server at %s://%s:%d%s: %s\n",
+                remote_url.scheme.c_str(), remote_url.host.c_str(), remote_url.port,
+                remote_url.path.c_str(), err.c_str()));
+        }
+        if (res.status != 200) {
+            throw std::runtime_error(string_format(
+                "the remote mmproj server at %s://%s:%d%s answered GET /v1/info with HTTP %d\n",
+                remote_url.scheme.c_str(), remote_url.host.c_str(), remote_url.port,
+                remote_url.path.c_str(), res.status));
+        }
+        std::string remote_model;
+        uint32_t remote_n_embd = 0;
+        bool remote_has_vision = false;
+        if (!mtmd_remote::parse_info_response(res.body, remote_model, remote_n_embd, remote_has_vision, err)) {
+            throw std::runtime_error(string_format(
+                "invalid /v1/info response from the remote mmproj server: %s\n", err.c_str()));
+        }
+        if (!remote_has_vision) {
+            throw std::runtime_error(
+                "the remote mmproj server has no vision encoder, it cannot serve image batches\n");
+        }
+        if ((int) remote_n_embd != n_embd_expected) {
+            throw std::runtime_error(string_format(
+                "the remote mmproj server ('%s') produces %u embeddings per token, but the local mmproj "
+                "produces %d - the remote server is running a different mmproj, refusing to continue\n",
+                remote_model.c_str(), remote_n_embd, n_embd_expected));
+        }
+        LOG_INF("%s: remote mmproj server '%s' ready (n_embd = %u)\n",
+                __func__, remote_model.c_str(), remote_n_embd);
     }
 
     void init_vision() {
@@ -1814,6 +1890,28 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
         return 1;
     }
 
+    // remote mmproj: hand the whole preprocessed batch to the remote server, which owns the
+    // mmproj GGUF and runs the exact same clip_image_batch_encode() there. What comes back is
+    // laid out identically, so the caller cannot tell the difference.
+    if (ctx->remote_enabled) {
+        std::vector<float> remote_embd;
+        std::string err;
+        if (!mtmd_remote::encode(ctx->remote_url, image_tokens->batch_f32, (uint32_t) n_embd_out,
+                                 out_embd.size(), ctx->remote_timeout_ms, remote_embd, err)) {
+            out_embd.clear();
+            LOG_ERR("%s: remote mmproj encoding failed: %s\n", __func__, err.c_str());
+            return 1;
+        }
+        if (remote_embd.size() != out_embd.size()) {
+            out_embd.clear();
+            LOG_ERR("%s: remote mmproj returned %zu embeddings, expected %zu (n_embd = %d, n_tokens = %u)\n",
+                    __func__, remote_embd.size(), out_embd.size(), n_embd_out, n_tokens_out);
+            return 1;
+        }
+        out_embd = std::move(remote_embd);
+        return 0;
+    }
+
     bool ok = clip_image_batch_encode(
         ctx_clip,
         ctx->n_threads,
@@ -1853,6 +1951,11 @@ static int32_t mtmd_encode_chunk_impl(mtmd_context * ctx, const mtmd_input_chunk
         if (chunk->tokens_audio->is_placeholder()) {
             LOG_ERR("%s: audio tokens batch is placeholder\n", __func__);
             return 1;
+        }
+        if (ctx->remote_enabled && !ctx->remote_warned_aud) {
+            ctx->remote_warned_aud = true;
+            LOG_WRN("%s: remote mmproj only offloads vision encoding; audio is still encoded locally\n",
+                    __func__);
         }
         int n_mmproj_embd = ctx->n_embd_out();
         out_embd.resize((size_t)chunk->tokens_audio->n_tokens * n_mmproj_embd);

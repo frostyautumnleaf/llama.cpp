@@ -14,9 +14,11 @@ find_package(Threads REQUIRED)
 
 add_library(mtmd
             mtmd.cpp
+            mtmd-remote.cpp
             mtmd-audio.cpp
             mtmd-image.cpp
             mtmd.h
+            mtmd-remote.h
             mtmd-internal.h
             mtmd-helper.cpp
             mtmd-helper-gen.cpp

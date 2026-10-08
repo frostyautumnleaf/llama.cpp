@@ -2609,6 +2609,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
+        {"--mmproj-remote-url"}, "URL",
+        "HTTP URL of a mmproj-processing-server to offload all image (mmproj vision) encoding to,\n"
+        "instead of encoding the images locally; see mmproj_processing_server/ in the repository\n"
+        "the server is only ever contacted over the LAN, e.g. http://192.168.1.20:8080\n"
+        "the server must run the very same mmproj file as this process\n"
+        "(default: disabled, encode images locally)",
+        [](common_params & params, const std::string & value) {
+            params.mmproj_remote_url = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_REMOTE_URL"));
+    add_opt(common_arg(
+        {"--mmproj-remote-timeout"}, "MS",
+        string_format("timeout in milliseconds of each remote image encoding request (default: %d)", params.mmproj_remote_timeout_ms),
+        [](common_params & params, int value) {
+            params.mmproj_remote_timeout_ms = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_REMOTE_TIMEOUT"));
+    add_opt(common_arg(
         // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
         {"-mmdev", "--mmproj-device"}, "DEVICE",
         "device to use for multimodal projector (none = don't offload, default: follows --device)\n"

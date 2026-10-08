@@ -162,6 +162,11 @@ struct mtmd_cli_context {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        mparams.remote_mmproj_url       = params.mmproj_remote_url.empty() ? nullptr : params.mmproj_remote_url.c_str();
+        mparams.remote_mmproj_timeout_ms = params.mmproj_remote_timeout_ms;
+        if (!params.mmproj_remote_url.empty()) {
+            LOG_INF("%s: encoding all images remotely via '%s'\n", __func__, params.mmproj_remote_url.c_str());
+        }
         {
             // non-causal models need the whole image in one ubatch
             const int n_ubatch = llama_n_ubatch(lctx);

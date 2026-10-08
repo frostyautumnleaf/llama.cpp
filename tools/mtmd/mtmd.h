@@ -122,6 +122,17 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // remote mmproj: HTTP URL of a mmproj-processing-server that owns the mmproj GGUF.
+    // When non-NULL, every vision batch that would be encoded by clip_image_batch_encode()
+    // is sent to that server instead, and the embeddings it returns are used verbatim.
+    // The mmproj is still loaded locally for metadata / image preprocessing, but no local
+    // vision encoding happens. NULL (default) = encode locally, exactly as before.
+    // See mmproj_processing_server/ in the fork.
+    const char * remote_mmproj_url;
+
+    // per-request timeout in milliseconds for the remote encode call
+    int remote_mmproj_timeout_ms;
 };
 
 MTMD_API const char * mtmd_default_marker(void);

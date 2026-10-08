@@ -1159,6 +1159,15 @@ private:
             // progress callback
             mparams.progress_callback           = load_progress_callback;
             mparams.progress_callback_user_data = &load_progress_mmproj;
+            // remote mmproj: images are encoded by the mmproj-processing-server over the LAN
+            mparams.remote_mmproj_url           = params_base.mmproj_remote_url.empty()
+                                                      ? nullptr
+                                                      : params_base.mmproj_remote_url.c_str();
+            mparams.remote_mmproj_timeout_ms    = params_base.mmproj_remote_timeout_ms;
+            if (!params_base.mmproj_remote_url.empty()) {
+                SRV_INF("%s: encoding all images remotely via '%s'\n", __func__,
+                        params_base.mmproj_remote_url.c_str());
+            }
         }
 
         // get the memory usage of mmproj, also used to check image_max_tokens against n_ubatch

@@ -91,6 +91,8 @@ int main(int argc, char ** argv) {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        mparams.remote_mmproj_url       = params.mmproj_remote_url.empty() ? nullptr : params.mmproj_remote_url.c_str();
+        mparams.remote_mmproj_timeout_ms = params.mmproj_remote_timeout_ms;
         {
             // always enable debug callback
             mparams.cb_eval_user_data = &cb_data;
