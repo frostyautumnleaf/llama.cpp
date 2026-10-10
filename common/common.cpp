@@ -6,6 +6,11 @@
 #include "common.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-expert-cache.h"
+#include "../src/llama-kv-stream.h"
+#include "../src/llama-model.h"
+#include "../src/llama-hparams.h"
+#include "../src/llama-context.h"
 
 #include "fit.h"
 #include "log.h"
@@ -1276,6 +1281,234 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->model.reset(model);
 
+    // The expert cache and the KV streaming window are ported on this branch but are not functional; see
+    // docs/strata-port-status.md. They are accepted and ignored rather than acted on, because acting on them
+    // is fatal:
+    //
+    //   - the arena is allocated with ggml_new_tensor_1d on a host ggml_context, so it is plain RAM. Nothing
+    //     puts it on a GPU, which is the whole point of the tier. Handing it to mul_mat_id as a weight tensor
+    //     makes the backend stage the host buffer on every MoE layer.
+    //   - one arena is shared by every MoE projection, but each projection is its own MUL_MAT_ID_CACHED with
+    //     its own shape, and the slot is sized from ffn_gate_exps alone while the copy writes gate+up+down.
+    //   - the residency table is written through a tensor made on the graph context, which is no_alloc, so its
+    //     data pointer is null: enabling the cache segfaults on the first graph build.
+    //   - --kv-resident streams K into the V window, so attention reads values the model never wrote.
+    if (params.expert_cache_slots > 0 || params.expert_cache_secondary_slots > 0
+            || params.expert_cache_tertiary_slots > 0 || params.expert_prefetch_slots > 0
+            || params.expert_adapt || !params.expert_profile.empty() || params.kv_resident > 0) {
+        LOG_WRN("the Strata expert cache (--expert-cache[-secondary|-tertiary], --expert-adapt, "
+                "--expert-prefetch, --expert-profile) and KV streaming (--kv-resident) are ported but not "
+                "functional on this branch, and are being ignored - see docs/strata-port-status.md.\n");
+        LOG_WRN("working Strata ports on this branch: --spec-type ngram-suffix, optionally with "
+                "--spec-ngram-suffix-refined, and the flat prompt-lookup caches\n");
+    }
+
+    // The blocks below stay in the tree as the starting point for the real port, guarded so none of them can
+    // run while the check above stands.
+    //
+    // Multi-GPU tiers (Strata's "second GPU as another expert tier"):
+    //   Tier 0: main GPU (--expert-cache N)
+    //   Tier 1: second GPU (--expert-cache-secondary N)
+    //   Tier 2: third GPU (--expert-cache-tertiary N)
+    // Experts are admitted to tier 0 first, then tier 1, then tier 2.
+    if (false && params.expert_cache_slots > 0) {
+        // Access the internal model structure to get expert information
+        llama_model * model_int = reinterpret_cast<llama_model *>(model);
+        const auto & hparams = model_int->hparams;
+
+        if (hparams.n_expert > 0) {
+            // Calculate expert blob size from the first expert tensor
+            const ggml_tensor * first_expert_tensor = model_int->get_tensor("blk.0.ffn_gate_exps");
+            if (first_expert_tensor == nullptr) {
+                first_expert_tensor = model_int->get_tensor("blk.0.ffn_up_exps");
+            }
+            int64_t blob_bytes = 0;
+            if (first_expert_tensor != nullptr) {
+                blob_bytes = ggml_nbytes(first_expert_tensor) / hparams.n_expert;
+                LOG_INF("expert cache: expert blob size = %lld bytes (from %s)\n",
+                        (long long)blob_bytes, first_expert_tensor->name);
+            } else {
+                const int64_t n_ff_exp = hparams.n_ff_exp(0);
+                const int64_t n_embd = hparams.n_embd;
+                blob_bytes = 3 * n_ff_exp * n_embd / 2; // approximate for Q4_K_XL
+                LOG_WRN("expert cache: could not find expert tensor, using estimated blob size %lld bytes\n",
+                        (long long)blob_bytes);
+            }
+
+            // Create a ggml context for the expert cache
+            ggml_init_params ctx_params = {
+                /*.mem_size   =*/ 32 * 1024 * 1024, // 32 MB for tensor metadata
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ false,
+            };
+            ggml_context * cache_ctx = ggml_init(ctx_params);
+            if (cache_ctx == nullptr) {
+                LOG_WRN("expert cache: failed to create ggml context\n");
+            } else {
+                std::string err;
+                llama_expert_cache cache;
+
+                // Open tier 0 (main GPU)
+                if (!cache.open(params.expert_cache_slots, hparams.n_layer(), hparams.n_expert,
+                                blob_bytes, cache_ctx, err)) {
+                    LOG_WRN("expert cache: failed to initialize tier 0: %s\n", err.c_str());
+                    ggml_free(cache_ctx);
+                } else {
+                    cache.set_per_layer_admission(true);
+                    LOG_INF("expert cache: tier 0 (main GPU) initialized with %d slots\n",
+                            params.expert_cache_slots);
+
+                    // Open tier 1 (secondary GPU) if requested
+                    if (params.expert_cache_secondary_slots > 0) {
+                        int tier1_idx = cache.open_tier(params.expert_cache_secondary_slots,
+                                                       cache_ctx, 1, err);
+                        if (tier1_idx < 0) {
+                            LOG_WRN("expert cache: failed to initialize tier 1: %s\n", err.c_str());
+                        } else {
+                            LOG_INF("expert cache: tier 1 (secondary GPU) initialized with %d slots\n",
+                                    params.expert_cache_secondary_slots);
+                        }
+                    }
+
+                    // Open tier 2 (tertiary GPU) if requested
+                    if (params.expert_cache_tertiary_slots > 0) {
+                        int tier2_idx = cache.open_tier(params.expert_cache_tertiary_slots,
+                                                       cache_ctx, 2, err);
+                        if (tier2_idx < 0) {
+                            LOG_WRN("expert cache: failed to initialize tier 2: %s\n", err.c_str());
+                        } else {
+                            LOG_INF("expert cache: tier 2 (tertiary GPU) initialized with %d slots\n",
+                                    params.expert_cache_tertiary_slots);
+                        }
+                    }
+
+                    // Load profile if specified and admit experts across all tiers
+                    if (!params.expert_profile.empty()) {
+                        std::vector<std::pair<int32_t, int32_t>> ranked;
+                        int64_t slots = 0;
+                        if (llama_read_expert_profile(params.expert_profile, hparams.n_layer(),
+                                                      hparams.n_expert, ranked, slots, err)) {
+                            // Admit experts from the profile in ranked order
+                            // admit() tries tiers in order (0, 1, 2)
+                            for (const auto & [layer, expert] : ranked) {
+                                if (cache.admit(layer, expert) < 0) {
+                                    break; // all tiers full
+                                }
+                            }
+                            LOG_INF("expert cache: loaded profile with %zu ranked pairs, %lld total resident\n",
+                                    ranked.size(), (long long)cache.total_resident());
+                        } else {
+                            LOG_WRN("expert cache: failed to load profile: %s\n", err.c_str());
+                        }
+                    }
+
+                    // P2P fallback: if a tier's GPU cannot P2P-access the main GPU,
+                    // promote its experts to tier 0 (copy weights to main GPU's cache).
+                    // Experts that don't fit in tier 0 fall back to original weights.
+                    if (cache.num_tiers() > 1) {
+                        for (int t = 1; t < cache.num_tiers(); ++t) {
+                            if (!ggml_cuda_peer_access_available(0, t)) {
+                                LOG_WRN("expert cache: no P2P access between GPU 0 and GPU %d, "
+                                        "promoting tier %d experts to tier 0\n", t, t);
+                                int64_t promoted = cache.promote_tier_to(t, 0);
+                                int64_t remaining = cache.resident(t);
+                                LOG_INF("expert cache: promoted %lld experts from tier %d to tier 0, "
+                                        "%lld remain in tier %d (will fall back to original weights)\n",
+                                        (long long)promoted, t, (long long)remaining, t);
+                            }
+                        }
+                    }
+
+                    // Store the cache in the model
+                    model_int->expert_cache = std::make_unique<llama_expert_cache>(std::move(cache));
+                    LOG_INF("expert cache: initialized with %d tiers, %lld total resident experts\n",
+                            model_int->expert_cache->num_tiers(),
+                            (long long)model_int->expert_cache->total_resident());
+
+                    // Enable runtime adaptation if requested
+                    if (params.expert_adapt) {
+                        llama_expert_adapt_params adapt_params;
+                        adapt_params.adapt_interval = params.expert_adapt_interval;
+                        adapt_params.max_moves = params.expert_adapt_max_moves;
+
+                        // Copy callback: copy expert weights from model tensors to slot
+                        // The slot contains concatenated gate, up, and down expert weights
+                        auto copy_expert_weights = [](int64_t layer, int64_t expert, void* slot_ptr,
+                                                      int64_t slot_bytes, void* user_data) {
+                            (void)slot_bytes;
+                            llama_model* model = static_cast<llama_model*>(user_data);
+                            int64_t slot_offset = 0;
+
+                            // Copy gate expert weights
+                            {
+                                std::string name = "blk." + std::to_string(layer) + ".ffn_gate_exps";
+                                const ggml_tensor* t = model->get_tensor(name.c_str());
+                                if (t != nullptr) {
+                                    const int64_t expert_bytes = ggml_nbytes(t) / t->ne[2];
+                                    const void* src = (const char*)t->data + expert * expert_bytes;
+                                    memcpy((char*)slot_ptr + slot_offset, src, expert_bytes);
+                                    slot_offset += expert_bytes;
+                                }
+                            }
+
+                            // Copy up expert weights
+                            {
+                                std::string name = "blk." + std::to_string(layer) + ".ffn_up_exps";
+                                const ggml_tensor* t = model->get_tensor(name.c_str());
+                                if (t != nullptr) {
+                                    const int64_t expert_bytes = ggml_nbytes(t) / t->ne[2];
+                                    const void* src = (const char*)t->data + expert * expert_bytes;
+                                    memcpy((char*)slot_ptr + slot_offset, src, expert_bytes);
+                                    slot_offset += expert_bytes;
+                                }
+                            }
+
+                            // Copy down expert weights
+                            {
+                                std::string name = "blk." + std::to_string(layer) + ".ffn_down_exps";
+                                const ggml_tensor* t = model->get_tensor(name.c_str());
+                                if (t != nullptr) {
+                                    const int64_t expert_bytes = ggml_nbytes(t) / t->ne[2];
+                                    const void* src = (const char*)t->data + expert * expert_bytes;
+                                    memcpy((char*)slot_ptr + slot_offset, src, expert_bytes);
+                                    slot_offset += expert_bytes;
+                                }
+                            }
+                        };
+
+                        adapt_params.copy_fn = copy_expert_weights;
+                        adapt_params.copy_user_data = model_int;
+
+                        std::string adapt_err;
+                        if (model_int->expert_cache->enable_adaptation(adapt_params, adapt_err)) {
+                            LOG_INF("expert cache: runtime adaptation enabled (interval=%d, max_moves=%d)\n",
+                                    params.expert_adapt_interval, params.expert_adapt_max_moves);
+                        } else {
+                            LOG_WRN("expert cache: failed to enable adaptation: %s\n", adapt_err.c_str());
+                        }
+                    }
+
+                    // Initialize prefetch if requested
+                    if (params.expert_prefetch_slots > 0) {
+                        if (model_int->expert_cache->num_tiers() < 2) {
+                            LOG_WRN("expert cache: prefetch requires --expert-cache-secondary, ignoring\n");
+                        } else {
+                            std::string pf_err;
+                            if (model_int->expert_cache->init_prefetch(params.expert_prefetch_slots, pf_err)) {
+                                LOG_INF("expert cache: prefetch enabled with %d slots\n",
+                                        params.expert_prefetch_slots);
+                            } else {
+                                LOG_WRN("expert cache: failed to initialize prefetch: %s\n", pf_err.c_str());
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            LOG_WRN("expert cache: model has no experts, ignoring\n");
+        }
+    }
+
     if (model_only) {
         return;
     }
@@ -1369,6 +1602,44 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->context.reset(lctx);
+
+    // Initialize KV streaming if requested
+    if (false && params.kv_resident > 0) {
+        // Access the internal context to get the KV cache
+        llama_context * lctx_int = reinterpret_cast<llama_context *>(lctx);
+        llama_memory_t mem = lctx_int->get_memory();
+
+        if (mem != nullptr) {
+            // Cast the memory to a KV cache
+            llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(mem);
+            if (kv != nullptr) {
+                // Get the main GPU device
+                ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+                if (dev == nullptr) {
+                    dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+                }
+                if (dev == nullptr) {
+                    dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL);
+                }
+
+                if (dev != nullptr) {
+                    llama_kv_stream * kv_stream = new llama_kv_stream();
+                    if (kv_stream->init(kv, params.kv_resident, dev)) {
+                        LOG_INF("kv streaming: initialized with %d resident entries on GPU\n",
+                                params.kv_resident);
+                        // Store the KV stream in the model for later use
+                        llama_model * model_int = reinterpret_cast<llama_model *>(model);
+                        model_int->kv_stream.reset(kv_stream);
+                    } else {
+                        LOG_WRN("kv streaming: failed to initialize\n");
+                        delete kv_stream;
+                    }
+                } else {
+                    LOG_WRN("kv streaming: no GPU device found\n");
+                }
+            }
+        }
+    }
 
     set_process_priority(params.cpuparams.priority);
 

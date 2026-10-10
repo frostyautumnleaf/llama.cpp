@@ -447,6 +447,23 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
+    // Expert cache multi-tier support (CUDA)
+    // Set the tier 1 (secondary GPU) slot tensor for the cached MoE kernel.
+    // Must be called before graph execution. Pass nullptr to disable tier 1.
+    GGML_API void ggml_cuda_set_expert_cache_tier1_slot_tensor(const struct ggml_tensor * tensor);
+
+    // Set the tier 2 (tertiary GPU) slot tensor for the cached MoE kernel.
+    // Must be called before graph execution. Pass nullptr to disable tier 2.
+    GGML_API void ggml_cuda_set_expert_cache_tier2_slot_tensor(const struct ggml_tensor * tensor);
+
+    // Set the tier 1 slot count. Used by the kernel to decode the residency table
+    // encoding for tier 1 vs tier 2. Must be called before graph execution.
+    GGML_API void ggml_cuda_set_expert_cache_tier1_slots(int slots);
+
+    // Check if P2P access is available between two CUDA devices.
+    // Returns true if dev0 can directly access dev1's memory (or vice versa).
+    GGML_API bool ggml_cuda_peer_access_available(int dev0, int dev1);
+
 #ifdef  __cplusplus
 }
 #endif

@@ -196,6 +196,38 @@ Example Video:
 
 - See #19164
 
+### Suffix Lookup (`ngram-suffix`)
+
+Ported from the [Strata](https://github.com/Niko1221/Strata) inference engine (MIT), where it is what makes answers
+that quote the prompt cheap to verify. It looks for the longest earlier repeat of the *whole* generated suffix - not
+of a fixed n-gram - and proposes what followed it there. When a model returns a file with one name changed, or repeats
+a block it has just written, the continuation is exact and one verify pass commits a long run of tokens.
+
+What sets it apart from the other n-gram implementations is the second half of the port, the draft policy. A long
+lookup window costs a long verify pass, and on ordinary text that pass is usually worth less than the model's own MTP
+drafts. The policy measures both sides online - the round time per window size, and the acceptance rate of lookup
+drafts by match length - and puts the lookup window in front of the target only when it is expected to commit more
+tokens per millisecond than the alternative, by `--spec-ngram-suffix-margin`. When it declines, the next implementation
+in the chain drafts instead:
+
+```
+# the model's own MTP drafts, with lookup drafts taking the window when they are expected to pay
+llama-server -m Qwen3.8-Flash-Next.gguf --spec-type draft-mtp,ngram-suffix
+
+# lookup alone: the policy then compares each window against plain decoding
+llama-server -m model.gguf --spec-type ngram-suffix
+```
+
+The policy chooses which drafts to verify, never what is emitted: the target model decides every token, so the output
+is the same text either way. `--spec-ngram-suffix-fixed` turns the policy off and drafts the whole proposal.
+
+A more sophisticated policy is available with `--spec-ngram-suffix-refined`, which uses Strata's plan v0.3 P6
+controller. It has an explicit cost model with per-expert CPU miss accounting (distinct experts grow with window
+size, and each missed expert adds a fraction of a read), per-position MTP acceptance tracking (position i's
+conditional acceptance is learned independently), and an expansion mechanism that lets the window grow when all
+drafted tokens are accepted. The cost model parameters (dense pass time, CPU miss time, hit rate, sync overhead,
+draft time) can be tuned to the specific machine and model with the `--spec-ngram-suffix-*` options.
+
 ### Differences between ngram-simple, ngram-map and ngram-mod
 
 - ngram-simple looks for a previous matching n-gram and inserts the following m-gram.
@@ -224,7 +256,7 @@ Use exactly one of these options:
 ### General Speculative Parameters
 
 ```
---spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
+--spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod|ngram-suffix]
                                         comma-separated list of types of speculative decoding to use
                                         (default: none)
                                         (env: LLAMA_ARG_SPEC_TYPE)
@@ -320,6 +352,35 @@ Use exactly one of these options:
                                         minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48)
 --spec-ngram-mod-n-max                  N
                                         maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64)
+```
+
+### Suffix Lookup Parameters
+
+```
+--spec-ngram-suffix-n-max               N
+                                        longest lookup draft for ngram-suffix speculative decoding; the verify window is N + 1 tokens (default: 7)
+--spec-ngram-suffix-min-match           N
+                                        shortest repeat of the generated suffix that ngram-suffix drafts from (default: 16)
+--spec-ngram-suffix-max-match           N
+                                        longest repeat of the generated suffix ngram-suffix looks for (default: 64)
+--spec-ngram-suffix-margin              P
+                                        how much faster than the alternative a lookup verify window has to be expected to pay for itself (default: 0.03)
+--spec-ngram-suffix-fixed               draft the whole lookup proposal instead of letting the draft policy choose the window
+--spec-ngram-suffix-refined             use Strata's refined window policy (plan v0.3 P6 controller) instead of the simple draft policy: an explicit cost model with per-expert CPU miss accounting, per-position MTP acceptance tracking, and an expansion mechanism (default: off)
+--spec-ngram-suffix-min-gain            P
+                                        the refined controller only switches when the gain exceeds this fraction (default: 0.05)
+--spec-ngram-suffix-ema                 P
+                                        EMA learning rate for the refined controller's acceptance tracking (default: 0.05)
+--spec-ngram-suffix-dense-ms            MS
+                                        one-token dense pass time in ms for the refined controller's cost model (default: 11.0)
+--spec-ngram-suffix-cpu-miss-ms         MS
+                                        all-experts-on-CPU time in ms for the refined controller's cost model (default: 15.8)
+--spec-ngram-suffix-hit-rate            P
+                                        share of distinct experts served from VRAM for the refined controller's cost model (default: 0.55)
+--spec-ngram-suffix-sync-ms             MS
+                                        device sync overhead in ms for the refined controller's cost model (default: 2.4)
+--spec-ngram-suffix-mtp-draft-ms        MS
+                                        per MTP draft token time in ms for the refined controller's cost model (default: 1.2)
 ```
 
 ### n-gram Simple Parameters

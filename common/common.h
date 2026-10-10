@@ -183,6 +183,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX,  // longest-match suffix lookup with an adaptive verify window
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -372,6 +373,30 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+// longest-match prompt lookup, ported from the Strata inference engine: the tokens that followed the longest
+// earlier repeat of the sequence's suffix are proposed, and the draft policy decides whether they or the model's
+// own drafts should fill the verify window - see common/ngram-suffix.h
+struct common_params_speculative_ngram_suffix {
+    int32_t n_max     = 7;    // longest lookup draft; the verify window is n_max + 1 tokens
+    int32_t min_match = 16;   // shortest repeat of the suffix worth drafting (Strata: 16)
+    int32_t max_match = 64;   // longest repeat to look for
+    double  margin    = 0.03; // the lookup window has to beat the alternative by this much to be taken
+    bool    adaptive  = true; // let the draft policy choose the window size (false: always draft the full proposal)
+
+    // Refined window policy (Strata's plan v0.3 P6 controller): an explicit cost model with per-expert
+    // CPU miss accounting, per-position MTP acceptance tracking, and an expansion mechanism. See
+    // common/spec-controller.h for the full model and defaults (measured on Strata's RTX 5070 with
+    // Qwen3.8-Flash-Next).
+    bool    refined   = false; // use the refined controller instead of the simple draft policy
+    double  min_gain  = 0.05;  // the refined controller only switches when the gain exceeds this
+    double  ema       = 0.05;  // EMA learning rate for acceptance tracking
+    double  dense_ms  = 11.0;  // one-token dense pass (cost model)
+    double  cpu_miss_ms = 15.8; // all experts on CPU (cost model)
+    double  hit_rate  = 0.55;  // share of distinct experts served from VRAM (cost model)
+    double  sync_ms   = 2.4;   // device sync overhead (cost model)
+    double  mtp_draft_ms = 1.2; // per MTP draft token (cost model)
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -387,6 +412,8 @@ struct common_params_speculative {
     common_params_speculative_ngram_map ngram_map_k4v;
 
     common_params_speculative_ngram_cache ngram_cache;
+
+    common_params_speculative_ngram_suffix ngram_suffix;
 
     bool has_dft() const {
         return !draft.mparams.empty();
@@ -471,6 +498,24 @@ struct common_params {
     float   yarn_beta_fast        = -1.0f; // YaRN low correction dim
     float   yarn_beta_slow        = -1.0f; // YaRN high correction dim
     int32_t yarn_orig_ctx         =     0; // YaRN original context length
+
+    // expert cache (adaptive VRAM expert tier, Strata R4)
+    int32_t expert_cache_slots = 0;     // number of expert cache slots on main GPU (0 = disabled)
+    int32_t expert_cache_secondary_slots = 0; // number of expert cache slots on second GPU (0 = disabled)
+    int32_t expert_cache_tertiary_slots = 0;  // number of expert cache slots on third GPU (0 = disabled)
+    std::string expert_profile;         // path to expert routing profile (STRP format)
+
+    // runtime expert cache adaptation (Strata adaptive_tier)
+    bool expert_adapt = false;          // enable runtime adaptation
+    int32_t expert_adapt_interval = 32; // adapt every N tokens
+    int32_t expert_adapt_max_moves = 16; // max experts to move per pass
+    int32_t expert_prefetch_slots = 0;  // number of prefetch slots (0 = disabled)
+
+    // KV streaming (Strata's resident window)
+    // When set, the full KV cache is stored in RAM and only N entries are kept
+    // resident in VRAM at any time. Needed entries are streamed from RAM to VRAM
+    // before each attention operation. 0 = disabled (all KV in VRAM).
+    int32_t kv_resident = 0;
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading

@@ -153,3 +153,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Project docs (private)
+docs/expert-cache-gpu-testing-prompt.md
+docs/multi-gpu-expert-cache.md

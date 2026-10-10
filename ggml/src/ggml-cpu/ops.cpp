@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 
 // ggml_compute_forward_dup
 
@@ -1925,26 +1926,29 @@ static void ggml_compute_forward_concat_any(
         o[dim] = src0->ne[dim];
     }
 
-    // Region 1: copy rows from src0
-    for (int i3 = 0; i3 < ne03; i3++) {
-        for (int i2 = ith; i2 < ne02; i2 += nth) {
-            for (int i1 = 0; i1 < ne01; i1++) {
-                const char * x = (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03;
-                      char * y = (      char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3;
-                memcpy(y, x, ggml_row_size(src0->type, ne00));
-            }
-        }
+    // Region 1: copy rows from src0, parallel over the flattened (i3, i2, i1) row space (see the
+    // note on the typed variants - splitting only over i2 leaves one thread doing all the work).
+    const int64_t nrow0 = ne01 * ne02 * ne03;
+    const size_t  row0  = ggml_row_size(src0->type, ne00);
+    for (int64_t ir = ith; ir < nrow0; ir += nth) {
+        const int64_t i1 = ir % ne01;
+        const int64_t i2 = (ir / ne01) % ne02;
+        const int64_t i3 = ir / (ne01 * ne02);
+        const char * x = (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03;
+              char * y = (      char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3;
+        memcpy(y, x, row0);
     }
 
     // Region 2: copy rows from src1, offset into dst by o[]
-    for (int i3 = 0; i3 < ne13; i3++) {
-        for (int i2 = ith; i2 < ne12; i2 += nth) {
-            for (int i1 = 0; i1 < ne11; i1++) {
-                const char * x = (const char *) src1->data + i1*nb11         + i2*nb12         + i3*nb13;
-                      char * y = (      char *)  dst->data + (i1 + o[1])*nb1 + (i2 + o[2])*nb2 + (i3 + o[3])*nb3 + o[0]*nb0;
-                memcpy(y, x, ggml_row_size(src1->type, ne10));
-            }
-        }
+    const int64_t nrow1 = ne11 * ne12 * ne13;
+    const size_t  row1  = ggml_row_size(src1->type, ne10);
+    for (int64_t ir = ith; ir < nrow1; ir += nth) {
+        const int64_t i1 = ir % ne11;
+        const int64_t i2 = (ir / ne11) % ne12;
+        const int64_t i3 = ir / (ne11 * ne12);
+        const char * x = (const char *) src1->data + i1*nb11         + i2*nb12         + i3*nb13;
+              char * y = (      char *)  dst->data + (i1 + o[1])*nb1 + (i2 + o[2])*nb2 + (i3 + o[3])*nb3 + o[0]*nb0;
+        memcpy(y, x, row1);
     }
 }
 
@@ -1971,11 +1975,15 @@ static void ggml_compute_forward_concat_i8(
 
     const int8_t * x;
 
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
-            for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
+    // Parallel over the flattened (i3, i2, i1) row space. The old split was over i2 alone, so a
+    // concat with ne2 == 1 - every 2-D concat, which is the common case - ran entirely on thread 0
+    // while the rest of the pool waited at the barrier.
+    const int64_t nrow = ne1 * ne2 * ne3;
+    for (int64_t ir = ith; ir < nrow; ir += nth) {
+        const int64_t i1 = ir % ne1;
+        const int64_t i2 = (ir / ne1) % ne2;
+        const int64_t i3 = ir / (ne1 * ne2);
+        for (int i0 = 0; i0 < ne0; i0++) {
                     if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
                         x = (const int8_t *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
                     } else {
@@ -1985,9 +1993,7 @@ static void ggml_compute_forward_concat_i8(
                     int8_t * y = (int8_t *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
 
                     *y = *x;
-                }
             }
-        }
     }
 }
 
@@ -2014,11 +2020,15 @@ static void ggml_compute_forward_concat_f16(
 
     const ggml_fp16_t * x;
 
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
-            for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
+    // Parallel over the flattened (i3, i2, i1) row space. The old split was over i2 alone, so a
+    // concat with ne2 == 1 - every 2-D concat, which is the common case - ran entirely on thread 0
+    // while the rest of the pool waited at the barrier.
+    const int64_t nrow = ne1 * ne2 * ne3;
+    for (int64_t ir = ith; ir < nrow; ir += nth) {
+        const int64_t i1 = ir % ne1;
+        const int64_t i2 = (ir / ne1) % ne2;
+        const int64_t i3 = ir / (ne1 * ne2);
+        for (int i0 = 0; i0 < ne0; i0++) {
                     if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
                         x = (const ggml_fp16_t *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
                     } else {
@@ -2028,9 +2038,7 @@ static void ggml_compute_forward_concat_f16(
                     ggml_fp16_t * y = (ggml_fp16_t *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
 
                     *y = *x;
-                }
             }
-        }
     }
 }
 
@@ -2057,11 +2065,15 @@ static void ggml_compute_forward_concat_f32(
 
     const float * x;
 
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
-            for (int i1 = 0; i1 < ne1; i1++) {
-                for (int i0 = 0; i0 < ne0; i0++) {
+    // Parallel over the flattened (i3, i2, i1) row space. The old split was over i2 alone, so a
+    // concat with ne2 == 1 - every 2-D concat, which is the common case - ran entirely on thread 0
+    // while the rest of the pool waited at the barrier.
+    const int64_t nrow = ne1 * ne2 * ne3;
+    for (int64_t ir = ith; ir < nrow; ir += nth) {
+        const int64_t i1 = ir % ne1;
+        const int64_t i2 = (ir / ne1) % ne2;
+        const int64_t i3 = ir / (ne1 * ne2);
+        for (int i0 = 0; i0 < ne0; i0++) {
                     if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
                         x = (const float *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
                     } else {
@@ -2071,9 +2083,7 @@ static void ggml_compute_forward_concat_f32(
                     float * y = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
 
                     *y = *x;
-                }
             }
-        }
     }
 }
 
@@ -11473,6 +11483,41 @@ void ggml_compute_forward_dsv4_hc_comb(
 
 // ggml_compute_forward_dsv4_hc_pre
 
+// The dsv4 hyper-connection kernels walk a flat element index and decompose it with a runtime
+// divisor (ir % n_embd, ir / n_embd). The compiler cannot strength-reduce that, so every single
+// element paid a 64-bit idiv - 20 to 40 cycles for what is otherwise 3 or 4 contiguous float
+// accesses. Measured on the Qwen3.8 Flash Next encode profile: hc_post 20.7 ms for 10.5 M elements
+// (82 cycles per element), hc_pre 7.6 ms for 2.6 M. The fast paths below walk the very same flat
+// range [ir0, ir1), but as nested runs of contiguous i0 with running pointers, so the divisor is
+// evaluated once per run (n_embd floats) instead of once per element.
+//
+// The arithmetic is untouched: same products, same order of accumulation, no fma, so the output is
+// bit-identical to the generic path. The one exception is hc_pre, where the generic path starts
+// from sum = 0.0f and adds the first term; that is written out literally below (0.0f + p), which
+// the compiler may fold to p - the only value that could ever differ is the sign of a zero.
+//
+// Env CPU3X_DSV4_FAST=1 turns the fast paths on, default off.
+static bool ggml_cpu_dsv4_fast_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * env = std::getenv("CPU3X_DSV4_FAST");
+        cached = (env != nullptr && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// CPU3X_DSV4_FAST=2 prints, once per op, whether the fast path was taken - the model's tensors are
+// not always contiguous, and a fast path that silently never runs looks exactly like no change.
+static void ggml_cpu_dsv4_fast_report(const char * what, bool taken) {
+    static int logged_post = 0, logged_pre = 0;
+    int * logged = nullptr;
+    if (what[3] == 'p' && what[4] == 'r') { logged = &logged_pre; } else { logged = &logged_post; }
+    if (*logged == 0 && ggml_cpu_dsv4_fast_enabled() && std::getenv("CPU3X_DSV4_FAST")[0] == '2') {
+        *logged = 1;
+        GGML_LOG_INFO("[dsv4-fast] %s: %s\n", what, taken ? "contiguous fast path" : "generic path (strides)");
+    }
+}
+
 static void ggml_compute_forward_dsv4_hc_pre_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -11512,6 +11557,66 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
     const int64_t dr  = (nr + nth - 1) / nth;
     const int64_t ir0 = dr * ith;
     const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    const bool dsv4_fast_ok = ggml_cpu_dsv4_fast_enabled() &&
+        nbx0 == sizeof(float) && nbd0 == sizeof(float) && nbw0 == sizeof(float);
+    ggml_cpu_dsv4_fast_report("hc_pre", dsv4_fast_ok);
+
+    if (dsv4_fast_ok) {
+        const int64_t shx1 = nbx1 / sizeof(float);
+        const int64_t shx2 = nbx2 / sizeof(float);
+        const int64_t shw1 = nbw1 / sizeof(float);
+        const int64_t shw2 = nbw2 / sizeof(float);
+        const int64_t shd1 = nbd1 / sizeof(float);
+
+        const float * xdata = (const float *) x->data;
+        const float * wdata = (const float *) weights->data;
+        float *       ddata = (float *) dst->data;
+
+        for (int64_t ir = ir0; ir < ir1; ) {
+            const int64_t it  = ir / n_embd;
+            const int64_t i0  = ir - it * n_embd;
+            const int64_t run = MIN(n_embd - i0, ir1 - ir);
+
+            const float * xp = xdata + it * shx2 + i0;
+            float *       dp = ddata + it * shd1 + i0;
+
+            for (int64_t ih = 0; ih < hc; ++ih) {
+                const float * xh = xp + ih * shx1;
+
+                if (gated) {
+                    const float * gh = wdata + ih * shw1 + it * shw2 + i0;
+                    for (int64_t k = 0; k < run; ++k) {
+                        const float wv = 1.0f / (1.0f + expf(-gh[k]));
+                        if (ih == 0) {
+                            dp[k] = 0.0f + xh[k] * wv;
+                        } else {
+                            dp[k] += xh[k] * wv;
+                        }
+                    }
+                } else {
+                    const float wv = wdata[it * shw1 + ih];
+                    if (ih == 0) {
+                        for (int64_t k = 0; k < run; ++k) {
+                            dp[k] = 0.0f + xh[k] * wv;
+                        }
+                    } else {
+                        for (int64_t k = 0; k < run; ++k) {
+                            dp[k] += xh[k] * wv;
+                        }
+                    }
+                }
+            }
+
+            for (int64_t k = 0; k < run; ++k) {
+                dp[k] = scale * dp[k];
+            }
+
+            ir += run;
+        }
+
+        return;
+    }
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t i0 = ir % n_embd;
@@ -11604,6 +11709,63 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     const int64_t dr  = (nr + nth - 1) / nth;
     const int64_t ir0 = dr * ith;
     const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    const bool dsv4_fast_ok = ggml_cpu_dsv4_fast_enabled() &&
+        nbx0 == sizeof(float) && nbr0 == sizeof(float) && nbp0 == sizeof(float) && nbd0 == sizeof(float) &&
+        (!comb || nbc0 == sizeof(float));
+    ggml_cpu_dsv4_fast_report("hc_post", dsv4_fast_ok);
+
+    if (dsv4_fast_ok) {
+        const int64_t npt  = n_embd * hc;   // flat elements per token
+        const int64_t shx1 = nbx1 / sizeof(float);
+        const int64_t shr1 = nbr1 / sizeof(float);
+        const int64_t shr2 = nbr2 / sizeof(float);
+        const int64_t shp1 = nbp1 / sizeof(float);
+        const int64_t shd1 = nbd1 / sizeof(float);
+        const int64_t shd2 = nbd2 / sizeof(float);
+
+        const float * xdata = (const float *) x->data;
+        const float * rdata = (const float *) residual->data;
+        const float * pdata = (const float *) post->data;
+        const float * cdata = comb ? (const float *) comb->data : nullptr;
+        float *       ddata = (float *) dst->data;
+
+        for (int64_t ir = ir0; ir < ir1; ) {
+            const int64_t it   = ir / npt;
+            const int64_t loc  = ir - it * npt;
+            const int64_t idst = loc / n_embd;
+            const int64_t i0   = loc - idst * n_embd;
+            const int64_t run  = MIN(n_embd - i0, ir1 - ir);
+
+            const float * xp = xdata + it * shx1 + i0;
+            const float * rp = rdata + it * shr2 + idst * shr1 + i0;
+            const float   pv = pdata[it * shp1 + idst];
+            float *       dp = ddata + it * shd2 + idst * shd1 + i0;
+
+            if (!comb) {
+                for (int64_t k = 0; k < run; ++k) {
+                    dp[k] = xp[k] * pv + rp[k];
+                }
+            } else {
+                const float * cp = cdata + it * (nbc2 / sizeof(float)) + idst * (nbc0 / sizeof(float));
+
+                for (int64_t k = 0; k < run; ++k) {
+                    dp[k] = xp[k] * pv;
+                }
+                for (int64_t isrc = 0; isrc < hc; ++isrc) {
+                    const float * rs = rp + (isrc - idst) * shr1;
+                    const float   cv = cp[isrc];
+                    for (int64_t k = 0; k < run; ++k) {
+                        dp[k] += rs[k] * cv;
+                    }
+                }
+            }
+
+            ir += run;
+        }
+
+        return;
+    }
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t i0     = ir % n_embd;

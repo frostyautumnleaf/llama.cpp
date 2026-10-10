@@ -8,6 +8,8 @@
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
+#include "ngram-suffix.h"
+#include "spec-controller.h"
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
@@ -18,6 +20,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -80,7 +83,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"ngram-suffix",  COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -179,6 +183,11 @@ struct common_speculative_impl {
 
     uint32_t n_seq;
     int32_t n_max; // maximum draft length after implementation-specific limits
+
+    // the length of the draft that won the round the current accept() call reports (0 = the round had no draft).
+    // the manager fills it in for every implementation, so one that abstained can still learn the shape of the
+    // rounds the others ran
+    int32_t n_round_draft = 0;
 
     size_t n_call_begin  = 0; // number of times this implementation was called for refresh.
     size_t n_call_draft  = 0; // number of times this implementation was called for generation.
@@ -2114,8 +2123,11 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         size_t cache_size = 0; // number of tokens in n-gram cache
 
         common_ngram_cache ngram_cache_context;
-        common_ngram_cache ngram_cache_dynamic;
-        common_ngram_cache ngram_cache_static;
+
+        // the caches read from disk are never written to, and a copy per sequence of a static cache built from a
+        // big corpus costs the RAM that the cache was made to save: share one instead
+        std::shared_ptr<const common_ngram_cache> ngram_cache_dynamic;
+        std::shared_ptr<const common_ngram_cache> ngram_cache_static;
     };
 
     std::vector<seq_info> sinfos;
@@ -2144,7 +2156,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
         if (!path_static.empty()) {
             try {
-                auto ngram_cache_static = common_ngram_cache_load(path_static);
+                auto ngram_cache_static = common_ngram_cache_load_shared(path_static);
 
                 for (auto & sinfo : sinfos) {
                     sinfo.ngram_cache_static = ngram_cache_static;
@@ -2157,7 +2169,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
         if (!path_dynamic.empty()) {
             try {
-                auto ngram_cache_dynamic = common_ngram_cache_load(path_dynamic);
+                auto ngram_cache_dynamic = common_ngram_cache_load_shared(path_dynamic);
 
                 for (auto & sinfo : sinfos) {
                     sinfo.ngram_cache_dynamic = ngram_cache_dynamic;
@@ -2209,8 +2221,8 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         common_ngram_cache_draft(
                 inp, result, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
                 sinfo.ngram_cache_context,
-                sinfo.ngram_cache_dynamic,
-                sinfo.ngram_cache_static);
+                *sinfo.ngram_cache_dynamic,
+                *sinfo.ngram_cache_static);
 
         if (result.size() > 0) {
             // delete first token in result (which is the id_last token)
@@ -2241,6 +2253,262 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 };
 
+// longest-match prompt lookup with an adaptive verify window, ported from the Strata inference engine
+// (Niko1221/Strata, MIT) - see common/ngram-suffix.h for what the two pieces do and why they are worth having.
+//
+// the drafter proposes the continuation of the longest earlier repeat of the sequence's suffix. where an answer
+// quotes its input - an edit, a refactor, a file returned with one name changed - the continuation is exact and
+// one verify pass commits a long run of tokens; where it is not, the proposal is short or absent.
+//
+// the policy is the interesting half. a long lookup window costs a long verify pass, and prompt lookup of that
+// shape loses to the model's own MTP drafts on ordinary text, so the drafts are proposed but only put in front
+// of the target when they are expected to commit more tokens per millisecond than the alternative does, by
+// `margin`. the alternative is whatever else is configured (draft-mtp and friends); with nothing else configured
+// the comparison is against plain decoding. when the policy declines, this implementation returns no draft and
+// the next one in the chain gets the window - see the priority list in common_speculative_init.
+struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
+    common_params_speculative_ngram_suffix params;
+
+    // one policy for every sequence: its cost curve is a property of the machine, and with several sequences a
+    // verify round runs over all of them at once, so the rounds they report are the same rounds
+    common_draft_policy policy;
+
+    // the refined controller (Strata's plan v0.3 P6): an explicit cost model with per-expert CPU miss
+    // accounting, per-position MTP acceptance tracking, and an expansion mechanism. used when
+    // params.refined is true; otherwise the simple draft policy above is used
+    std::unique_ptr<spec_ctrl::controller> refined_ctrl;
+
+    const bool has_alt; // whether another drafter answers the rounds this one declines
+    const int  t_alt;   // the window size that drafter would have used (1 + its drafts)
+
+    struct seq_info {
+        common_suffix_drafter drafter;
+
+        size_t n_seen = 0; // tokens fed to the drafter: the whole sequence, ending with the last sampled token
+
+        bool lookup = false; // the round in flight carries our drafts
+        int  drafts = 0;     // how many
+        int  match  = 0;     // the length of the repeat they come from
+
+        int64_t t_round_us = 0; // when the round in flight started; 0 once it has been reported back
+    };
+
+    std::vector<seq_info> sinfos;
+
+    std::vector<llama_token> scratch; // the proposal, until the policy's pick is applied
+
+    common_speculative_impl_ngram_suffix(
+            const common_params_speculative & params,
+            uint32_t n_seq,
+            bool has_alt,
+            int t_alt)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX, n_seq, params.ngram_suffix.n_max)
+        , params(params.ngram_suffix)
+        , policy(common_draft_policy::k_max_t, params.ngram_suffix.margin)
+        , has_alt(has_alt)
+        , t_alt(std::max(1, t_alt)) {
+        SPC_TRC("%s", "adding speculative implementation 'ngram-suffix'\n");
+
+        if (this->params.n_max < 1 || this->params.n_max > common_draft_policy::k_max_t - 1) {
+            SPC_WRN("ngram-suffix n_max=%d is outside [1, %d] - clamping\n",
+                    this->params.n_max, common_draft_policy::k_max_t - 1);
+
+            this->params.n_max = std::max(1, std::min(this->params.n_max, common_draft_policy::k_max_t - 1));
+            n_max              = this->params.n_max;
+        }
+
+        policy.set_fallback(has_alt);
+
+        if (this->params.refined) {
+            spec_ctrl::cost_model cm;
+            cm.dense_ms        = this->params.dense_ms;
+            cm.cpu_all_miss_ms = this->params.cpu_miss_ms;
+            cm.hit_rate        = this->params.hit_rate;
+            cm.sync_ms         = this->params.sync_ms;
+            cm.mtp_draft_ms    = this->params.mtp_draft_ms;
+            refined_ctrl = std::make_unique<spec_ctrl::controller>(
+                cm, this->params.min_gain, this->params.ema);
+            SPC_TRC("- refined controller enabled: min_gain=%.2f, ema=%.2f, dense=%.1fms, cpu_miss=%.1fms, "
+                    "hit_rate=%.2f, sync=%.1fms, mtp_draft=%.1fms\n",
+                    this->params.min_gain, this->params.ema, this->params.dense_ms,
+                    this->params.cpu_miss_ms, this->params.hit_rate, this->params.sync_ms,
+                    this->params.mtp_draft_ms);
+        }
+
+        sinfos.resize(n_seq);
+        for (auto & sinfo : sinfos) {
+            sinfo.drafter = common_suffix_drafter(this->params.min_match, this->params.max_match);
+        }
+
+        SPC_TRC("- n_max=%d, min_match=%d, max_match=%d, margin=%.3f, adaptive=%d, refined=%d, "
+                "fallback=%s (window %d)\n",
+                this->params.n_max, this->params.min_match, this->params.max_match, this->params.margin,
+                this->params.adaptive, this->params.refined,
+                has_alt ? "the other drafter" : "plain decoding", t_alt);
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        auto & sinfo = sinfos[seq_id];
+
+        sinfo.drafter.reset();
+        sinfo.drafter.assign(prompt.data(), prompt.size());
+
+        sinfo.n_seen     = prompt.size(); // the last sampled token is not in the prompt yet
+        sinfo.lookup     = false;
+        sinfo.drafts     = 0;
+        sinfo.match      = 0;
+        sinfo.t_round_us = 0;
+    }
+
+    // keep the drafter level with the sequence. the n-gram caches do the same thing: the sequence only ever grows
+    // between rounds, so the new tokens are appended by index. the one token that can be checked cheaply is the
+    // last one fed in the previous round - a rollback, or a slot handed back to a new task, shows up here
+    void sync(seq_info & sinfo, const llama_tokens & prompt, llama_token id_last) {
+        size_t n = sinfo.n_seen;
+
+        if (n > prompt.size() + 1) {
+            n = 0; // the sequence shrank: a rollback, or a checkpoint restored under a draft
+        } else if (n > 0) {
+            const llama_token expect = n - 1 < prompt.size() ? prompt[n - 1] : id_last;
+            if (sinfo.drafter.token_at(n - 1) != expect) {
+                n = 0; // the token fed in the last round has gone: the sequence changed under the drafter
+            }
+        }
+
+        // assign(), not reset(): it keeps the prefix the two have in common and undoes the positions past it
+        // newest-first, which leaves the index exactly as appending that prefix alone would have. a rollback on
+        // a 128K-token sequence is then the cost of the rollback, not of the sequence
+
+        if (n == prompt.size() + 1) {
+            return; // nothing new since the last round
+        }
+
+        if (n == 0) {
+            sinfo.drafter.assign(prompt.data(), prompt.size());
+        } else {
+            for (size_t i = n; i < prompt.size(); ++i) {
+                sinfo.drafter.append(prompt[i]);
+            }
+        }
+
+        sinfo.drafter.append(id_last);
+
+        sinfo.n_seen = prompt.size() + 1;
+    }
+
+    void draft_one(llama_seq_id seq_id, common_speculative_draft_params & dparams) {
+        auto & sinfo  = sinfos[seq_id];
+        auto & result = *dparams.result;
+
+        const auto & prompt = *dparams.prompt;
+
+        // the round starts here; accept() measures it. the drafting itself costs microseconds next to a verify
+        // pass, so the stamp is as close to the round as makes no difference
+        sinfo.t_round_us = ggml_time_us();
+        sinfo.lookup     = false;
+        sinfo.drafts     = 0;
+        sinfo.match      = 0;
+
+        sync(sinfo, prompt, dparams.id_last);
+
+        const int n_cap = dparams.n_max > 0 ? std::min(dparams.n_max, params.n_max) : params.n_max;
+        if (n_cap <= 0) {
+            return;
+        }
+
+        scratch.resize(n_cap);
+        const int k = sinfo.drafter.propose(n_cap, scratch.data());
+
+        sinfo.match = sinfo.drafter.last_match();
+        if (k <= 0) {
+            return; // no repeat of the suffix long enough to be evidence
+        }
+
+        int n_draft = k;
+
+        if (params.adaptive) {
+            if (params.refined && refined_ctrl) {
+                // refined controller: Strata's plan v0.3 P6 with explicit cost model
+                const bool mtp_ready = has_alt && t_alt > 1;
+                const spec_ctrl::choice c = refined_ctrl->choose(k, sinfo.match, mtp_ready);
+                if (c.src != spec_ctrl::source::lookup) {
+                    return; // the controller chose none or MTP: leave the window
+                }
+                n_draft = std::min(k, c.k);
+            } else {
+                const common_draft_policy::pick p = policy.choose(t_alt, k, sinfo.match);
+                if (!p.lookup) {
+                    return; // the alternative is expected to commit more per millisecond: leave it the window
+                }
+                n_draft = std::min(k, p.t - 1);
+            }
+        }
+
+        if (n_draft <= 0) {
+            return;
+        }
+
+        result.assign(scratch.begin(), scratch.begin() + n_draft);
+
+        sinfo.lookup = true;
+        sinfo.drafts = n_draft;
+    }
+
+    bool process(const common_batch & /*batch*/) override {
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        assert(dparams.size() == n_seq);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            draft_one(seq_id, dp);
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        auto & sinfo = sinfos[seq_id];
+
+        // a round that never reached the target (an aborted slot) keeps no timing to report
+        const double round_ms = sinfo.t_round_us > 0 ? (double) (ggml_time_us() - sinfo.t_round_us) / 1000.0 : 0.0;
+
+        sinfo.t_round_us = 0;
+
+        if (sinfo.lookup) {
+            if (params.refined && refined_ctrl) {
+                // refined controller: observe the lookup outcome
+                spec_ctrl::choice c;
+                c.src = spec_ctrl::source::lookup;
+                c.k = sinfo.drafts;
+                refined_ctrl->observe(c, n_accepted, sinfo.match);
+            }
+            policy.observe(true, sinfo.drafts + 1, n_accepted, sinfo.match, round_ms);
+            sinfo.lookup = false;
+            return;
+        }
+
+        if (!is_other) {
+            return; // a round we did not start and no one else drafted either
+        }
+
+        // the fallback drafter's round: its window is what the manager says it drafted, plus the token the
+        // target always commits; 0 means it abstained too, which is a plain round of one token
+        if (params.refined && refined_ctrl && n_round_draft > 0) {
+            // refined controller: observe the MTP outcome
+            spec_ctrl::choice c;
+            c.src = spec_ctrl::source::mtp;
+            c.k = n_round_draft;
+            refined_ctrl->observe(c, n_accepted, 0);
+        }
+        policy.observe(false, n_round_draft > 0 ? n_round_draft + 1 : 1, n_accepted, 0, round_ms);
+    }
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -2249,6 +2517,10 @@ struct common_speculative {
 
     // which implementaion was used for a given seq_id
     std::vector<common_speculative_impl *> impl_last;
+
+    // the draft length of the implementation that won the current round, per seq_id; reported to every
+    // implementation through common_speculative_impl::n_round_draft when the round comes back
+    std::vector<uint16_t> n_draft_last;
 
     std::vector<double> synth_probs;
 };
@@ -2262,22 +2534,6 @@ static common_ngram_map get_common_ngram_map(
     uint16_t min_hits   = config.min_hits;
 
     return common_ngram_map(size_key, size_value, key_only, min_hits);
-}
-
-static common_speculative_impl_ngram_cache create_state_ngram_cache(
-        const common_speculative_config & config,
-        uint32_t n_seq,
-        const std::string & path_static,
-        const std::string & path_dynamic) {
-    uint16_t n_draft = 8; // TODO get from config?
-
-    // TODO bool param in common/common.h to set save_static/save_dynamic?
-    bool save_static = false;
-    bool save_dynamic = false;
-
-    common_speculative_impl_ngram_cache state(config.params, n_seq, n_draft, path_static, path_dynamic, save_static, save_dynamic);
-
-    return state;
 }
 
 std::string common_speculative_type_name_str(const std::vector<common_speculative_type> & types) {
@@ -2317,6 +2573,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX:  return "ngram-suffix";
         default:                                    return "unknown";
     }
 }
@@ -2393,10 +2650,16 @@ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_
     return result;
 }
 
-int32_t common_speculative_n_max(const common_params_speculative * spec) {
+// the longest draft the enabled types can produce, with one type left out (used by a drafter that has to
+// estimate what the rest of the chain would have drafted in its place)
+static int32_t common_speculative_n_max_excluding(const common_params_speculative * spec,
+        common_speculative_type skip) {
     int32_t n_max = 0;
 
     for (const auto type : spec->types) {
+        if (type == skip) {
+            continue;
+        }
         switch (type) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
@@ -2420,6 +2683,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
                 break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX:
+                n_max = std::max(n_max, std::max(0, spec->ngram_suffix.n_max));
+                break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
                 break;
@@ -2427,6 +2693,10 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
     }
 
     return n_max;
+}
+
+int32_t common_speculative_n_max(const common_params_speculative * spec) {
+    return common_speculative_n_max_excluding(spec, COMMON_SPECULATIVE_TYPE_COUNT);
 }
 
 int32_t common_speculative_n_max(const common_speculative * spec) {
@@ -2693,7 +2963,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2702,6 +2972,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
+        // before the model drafters on purpose: when the draft policy says the lookup window is not worth it this
+        // implementation returns no draft and the chain falls through to draft-mtp and the rest
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX);
 
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
@@ -2773,11 +3046,42 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {
-                auto state = create_state_ngram_cache(
-                        config, n_seq,
-                        params.ngram_cache.lookup_cache_static,
-                        params.ngram_cache.lookup_cache_dynamic);
-                impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                // built in place: the loaded caches are shared, so the state cannot be copied through a helper
+                impls.push_back(
+                        std::make_unique<common_speculative_impl_ngram_cache>(
+                            config.params,
+                            n_seq,
+                            8, // TODO get n_draft from config?
+                            params.ngram_cache.lookup_cache_static,
+                            params.ngram_cache.lookup_cache_dynamic,
+                            false, // TODO bool param in common/common.h to set save_dynamic?
+                            false)); // TODO bool param in common/common.h to set save_static?
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX: {
+                // rounds this implementation declines go to whatever else is configured; the model drafters only
+                // answer if they have a context to draft with, and with nothing at all the policy compares the
+                // lookup window against plain decoding
+                const bool has_alt = std::any_of(params.types.begin(), params.types.end(),
+                        [&params](common_speculative_type t) {
+                            if (t == COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX || t == COMMON_SPECULATIVE_TYPE_NONE) {
+                                return false;
+                            }
+                            const bool needs_dft =
+                                t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE
+                                || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3
+                                || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP
+                                || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
+                                || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+                            return !needs_dft || params.draft.ctx_dft != nullptr;
+                        });
+
+                const int32_t n_alt = common_speculative_n_max_excluding(
+                        &params, COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX);
+
+                impls.push_back(
+                        std::make_unique<common_speculative_impl_ngram_suffix>(
+                            config.params, n_seq, has_alt, has_alt ? n_alt + 1 : 1));
                 break;
             }
             default:
@@ -2794,6 +3098,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .dparams     = */ common_speculative_draft_params_vec(n_seq),
         /* .impls       = */ std::move(impls),
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
+        /* .n_draft_last= */ std::vector<uint16_t>(n_seq, 0),
         /* .synth_probs = */ {},
     });
 
@@ -2930,8 +3235,9 @@ void common_speculative_draft(common_speculative * spec) {
                             common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt->size(),
                             impl.get()->n_call_draft, result.size());
 
-                    // remember which implementation was used
-                    spec->impl_last[seq_id] = impl.get();
+                    // remember which implementation was used, and how long its draft was
+                    spec->impl_last[seq_id]     = impl.get();
+                    spec->n_draft_last[seq_id]  = (uint16_t) result.size();
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
@@ -2961,9 +3267,16 @@ void common_speculative_draft(common_speculative * spec) {
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
+    const uint16_t n_round_draft = spec->n_draft_last[seq_id];
+    spec->n_draft_last[seq_id] = 0;
+
     if (impl == nullptr) {
         GGML_ASSERT(n_accepted == 0);
         return;
+    }
+
+    for (auto & impl_i : spec->impls) {
+        impl_i->n_round_draft = n_round_draft;
     }
 
     {

@@ -1022,6 +1022,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
+    "MUL_MAT_ID_CACHED",
     "OUT_PROD",
 
     "SCALE",
@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1137,6 +1138,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "X[i]*Y",
+    "X[i]*Y (cached)",
     "X*Y",
 
     "x*v",
@@ -1216,7 +1218,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3420,6 +3422,78 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+// an arena is a view over slot storage holding byte-for-byte copies of experts of `as`, so the
+// rows have to line up exactly or the backend will read a quant block out of the wrong place.
+static void ggml_mul_mat_id_cached_assert_arena(const struct ggml_tensor * as, const struct ggml_tensor * arena, int tier) {
+    GGML_ASSERT(arena != NULL  && "expert cache: tier arena must not be null");
+    GGML_ASSERT(arena->type == as->type);
+    GGML_ASSERT(arena->ne[0] == as->ne[0] && arena->ne[1] == as->ne[1]);
+    GGML_ASSERT(arena->nb[0] == as->nb[0] && arena->nb[1] == as->nb[1]);
+    // nb[2] of `as` is one expert blob; a slot is at least that big (usually bigger, since it
+    // holds every projection of the expert and each projection views its own part of it)
+    GGML_ASSERT(arena->ne[2] > 0 && arena->nb[2] >= as->nb[2]);
+    GGML_UNUSED(tier);
+}
+
+struct ggml_tensor * ggml_mul_mat_id_cached(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * cached,
+        struct ggml_tensor  * residency,
+        int32_t               layer,
+        struct ggml_tensor  * cached1,
+        struct ggml_tensor  * cached2,
+        int32_t               tier1_slots) {
+    GGML_ASSERT(!ggml_is_transposed(as));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(residency->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(as->ne[3] == 1); // as is 3d (one matrix per expert)
+    GGML_ASSERT(b->ne[3] == 1); // b is 3d
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
+    GGML_ASSERT(ids->ne[1] == b->ne[2]); // must have an expert list per b row
+    GGML_ASSERT(as->ne[0] == b->ne[0]); // can_mul_mat
+    GGML_ASSERT(ids->ne[0] % b->ne[1] == 0); // can broadcast
+
+    GGML_ASSERT(cached != NULL && "expert cache: tier 0 arena is required");
+    ggml_mul_mat_id_cached_assert_arena(as, cached, 0);
+    if (cached1) {
+        ggml_mul_mat_id_cached_assert_arena(as, cached1, 1);
+        GGML_ASSERT(tier1_slots == (int32_t) cached1->ne[2]);
+    } else {
+        GGML_ASSERT(tier1_slots == 0);
+    }
+    if (cached2) {
+        ggml_mul_mat_id_cached_assert_arena(as, cached2, 2);
+    }
+
+    // the residency table is one row per layer for the whole model - a node has to say which row
+    // it wants, otherwise every layer reads layer 0's residency
+    GGML_ASSERT(layer >= 0);
+    GGML_ASSERT(residency->ne[0] % as->ne[2] == 0);
+    GGML_ASSERT((int64_t) layer < residency->ne[0] / as->ne[2]);
+
+    const int64_t ne[4] = { as->ne[1], ids->ne[0], b->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT_ID_CACHED;
+    result->src[0] = as;
+    result->src[1] = b;
+    result->src[2] = ids;
+    result->src[3] = cached;
+    result->src[4] = residency;
+    result->src[5] = cached1;
+    result->src[6] = cached2;
+
+    memset(result->op_params, 0, sizeof(result->op_params));
+    memcpy(result->op_params + 0, &tier1_slots, sizeof(int32_t));
+    memcpy(result->op_params + 1, &layer,       sizeof(int32_t));
 
     return result;
 }
@@ -8174,4 +8248,24 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
     if (p0->poll       != p1->poll       ) return false;
     if (p0->strict_cpu != p1->strict_cpu ) return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
+}
+
+// Expert cache multi-tier support (CUDA)
+// Stub for non-CUDA builds; the real implementation is in ggml-cuda.cu
+void ggml_cuda_set_expert_cache_tier1_slot_tensor(const struct ggml_tensor * tensor) {
+    (void)tensor;
+}
+
+void ggml_cuda_set_expert_cache_tier2_slot_tensor(const struct ggml_tensor * tensor) {
+    (void)tensor;
+}
+
+void ggml_cuda_set_expert_cache_tier1_slots(int slots) {
+    (void)slots;
+}
+
+bool ggml_cuda_peer_access_available(int dev0, int dev1) {
+    (void)dev0;
+    (void)dev1;
+    return true; // Assume P2P is available on non-CUDA builds
 }

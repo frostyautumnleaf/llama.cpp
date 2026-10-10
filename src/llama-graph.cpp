@@ -7,6 +7,8 @@
 #include "llama-cparams.h"
 #include "llama-sampler.h"
 
+#include "ggml-backend.h"
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
@@ -1526,6 +1528,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
+    expert_cache     (params.expert_cache),
+    kv_stream        (params.kv_stream),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1539,7 +1543,6 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
         cb_func(ubatch, cur, name, il);
     }
 }
-
 
 
 ggml_tensor * llm_graph_context::build_cvec(
@@ -1592,11 +1595,50 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s,
-          ggml_tensor * slots) const {
-    // the experts in the MoE cache are selected by their slots
-    ggml_tensor * res = slots == nullptr ?
-        ggml_mul_mat_id(ctx0, w, cur, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+          ggml_tensor * slots,
+                  int   il) const {
+    ggml_tensor * res;
+    if (slots != nullptr) {
+        // the experts in the MoE cache are selected by their slots
+        res = ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+    } else if (expert_cache && expert_cache->valid() && il >= 0) {
+        // Use the cached MoE operation
+        // Pass w to slot_tensor() so it can create a properly-shaped view
+        // in the graph context
+
+        // For multi-tier, use the combined residency table that encodes (tier, slot)
+        // Encoding: enc >= 0 → tier 0 slot=enc; enc == -1 → not resident;
+        // enc <= -2 → val=-enc-2; if val < tier1_slots → tier 1 slot=val;
+        // else → tier 2 slot=val-tier1_slots
+        ggml_tensor * combined_res = expert_cache->combined_residency_table(ctx0);
+        if (combined_res == nullptr) {
+            combined_res = expert_cache->residency_table_tensor(0);
+        }
+
+        // Pass tier slot tensors directly to the operation (thread-safe)
+        ggml_tensor * tier0_slots = expert_cache->slot_tensor(0, ctx0, w);
+        ggml_tensor * tier1_slots_tensor = nullptr;
+        ggml_tensor * tier2_slots_tensor = nullptr;
+        int32_t tier1_slot_count = 0;
+
+        if (expert_cache->num_tiers() > 1) {
+            tier1_slots_tensor = expert_cache->slot_tensor(1, ctx0, w);
+            tier1_slot_count = (int32_t)expert_cache->slots(1);
+        }
+        if (expert_cache->num_tiers() > 2) {
+            tier2_slots_tensor = expert_cache->slot_tensor(2, ctx0, w);
+        }
+
+        res = ggml_mul_mat_id_cached(ctx0, w, cur, ids,
+                                     tier0_slots,
+                                     combined_res,
+                                     il,
+                                     tier1_slots_tensor,
+                                     tier2_slots_tensor,
+                                     tier1_slot_count);
+    } else {
+        res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2168,6 +2210,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
+    // Record expert usage for runtime adaptation (Strata adaptive_tier)
+    record_expert_usage(il, selected_experts);
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -2228,7 +2273,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, slots, il); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2247,7 +2292,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, slots, il); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2260,7 +2305,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slots, il); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2361,7 +2406,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots, il); // [n_embd, n_expert_used, n_tokens]
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
@@ -3039,8 +3084,17 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
         }
 
-        k = mctx_cur->get_k(ctx0, il);
-        v = mctx_cur->get_v(ctx0, il);
+        // KV streaming: if enabled, stream the most recent entries to VRAM
+        // and use the VRAM window tensors for attention
+        if (kv_stream != nullptr && kv_stream->valid()) {
+            const uint32_t n_kv = mctx_cur->get_n_kv();
+            kv_stream->stream_layer(il, n_kv);
+            k = kv_stream->get_k(il, ctx0, n_kv);
+            v = kv_stream->get_v(il, ctx0, n_kv);
+        } else {
+            k = mctx_cur->get_k(ctx0, il);
+            v = mctx_cur->get_v(ctx0, il);
+        }
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
@@ -3133,7 +3187,14 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k;
+    if (kv_stream != nullptr && kv_stream->valid()) {
+        const uint32_t n_kv = mctx_cur->get_n_kv();
+        kv_stream->stream_layer(il, n_kv);
+        k = kv_stream->get_k(il, ctx0, n_kv);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+    }
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
@@ -3218,7 +3279,14 @@ ggml_tensor * llm_graph_context::build_attn(
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k;
+    if (kv_stream != nullptr && kv_stream->valid()) {
+        const uint32_t n_kv = mctx_cur->get_n_kv();
+        kv_stream->stream_layer(il, n_kv);
+        k = kv_stream->get_k(il, ctx0, n_kv);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+    }
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
@@ -3305,8 +3373,20 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k;
+    ggml_tensor * v;
+    if (use_kv_cur) {
+        k = k_cur;
+        v = v_cur;
+    } else if (kv_stream != nullptr && kv_stream->valid()) {
+        const uint32_t n_kv = mctx_cur->get_n_kv();
+        kv_stream->stream_layer(il, n_kv);
+        k = kv_stream->get_k(il, ctx0, n_kv);
+        v = kv_stream->get_v(il, ctx0, n_kv);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+        v = mctx_cur->get_v(ctx0, il);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -3376,7 +3456,14 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // MLA-style attention: the cached K is used as V
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k;
+    if (kv_stream != nullptr && kv_stream->valid()) {
+        const uint32_t n_kv = mctx_cur->get_n_kv();
+        kv_stream->stream_layer(il, n_kv);
+        k = kv_stream->get_k(il, ctx0, n_kv);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+    }
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);

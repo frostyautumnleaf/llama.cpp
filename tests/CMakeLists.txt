@@ -155,6 +155,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
     llama_build_and_test(test-sampling.cpp)
+    llama_build_and_test(test-ngram-cache.cpp)
+    target_compile_definitions(test-ngram-cache PRIVATE TEST_NGRAM_COMMON_LINKED)
+    # the default run is the equivalence tests; pass --sim to the built binary for the round simulator and the benchmark
+    llama_build_and_test(test-ngram-suffix.cpp)
+    # drives the ngram-suffix wiring (the chain, the policy's decline, the resync) with a simulated target
+    llama_build_and_test(test-spec-suffix.cpp)
+    # the refined speculative window policy (Strata's plan v0.3 P6 controller)
+    llama_build_and_test(test-spec-controller.cpp)
+    # mul_mat_id over expert-cache slots: quantized slots and per-layer residency
+    llama_build_and_test(test-mul-mat-id-cached.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
     llama_build_and_test(test-grammar-integration.cpp)
@@ -205,6 +215,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-generate-models PROPERTIES
         FIXTURES_SETUP generate-models
+    )
+
+    # Regression test for the MTP compress-ratio fix (commit 5a60b8258): draft-mtp must run over a fixture that carries an MTP block
+    llama_test(
+        test-llama-archs
+        NAME test-mtp-draft-qwen4exp
+        LABEL main
+        ARGS -a qwen4exp -b CPU
     )
 
     # Test recurrent-state rollback across all architectures, using the generated dummy models

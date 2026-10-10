@@ -14,6 +14,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -21,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 //
 // llama_context
@@ -1492,6 +1494,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // Apply expert usage tracking for runtime adaptation (Strata adaptive_tier)
+    if (model.expert_cache && model.expert_cache->adaptation_enabled() && !res->expert_usage.empty()) {
+        for (const auto & entry : res->expert_usage) {
+            ggml_tensor * sel = entry.selected_experts;
+            if (sel == nullptr) continue;
+
+            const int64_t n_entries = sel->ne[0] * sel->ne[1];
+            if (n_entries <= 0) continue;
+
+            // Get the backend for this tensor
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), sel);
+            if (backend == nullptr) continue;
+
+            // Copy the tensor to host
+            std::vector<int32_t> ids(n_entries);
+            ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, n_entries * sizeof(int32_t));
+
+            // Update usage counters
+            model.expert_cache->record_usage_layer(entry.layer, ids.data(), n_entries);
+        }
+        res->expert_usage.clear();
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2133,6 +2158,74 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    // Runtime expert cache adaptation (Strata adaptive_tier)
+    // Check if adaptation should run based on token count
+    if (model.expert_cache && model.expert_cache->adaptation_enabled()) {
+        model.expert_cache->record_usage_tokens(n_tokens_all);
+        if (model.expert_cache->should_adapt()) {
+            std::string adapt_err;
+            int64_t moves = model.expert_cache->adapt(adapt_err);
+            if (!adapt_err.empty()) {
+                LLAMA_LOG_WARN("%s: expert cache adaptation failed: %s\n", __func__, adapt_err.c_str());
+            } else if (moves > 0) {
+                LLAMA_LOG_INFO("%s: expert cache adapted %lld experts after %lld tokens\n",
+                               __func__, (long long)moves, (long long)n_tokens_all);
+            }
+        }
+    }
+
+    // Expert cache prefetch (Strata's second_gpu.cpp prefetch)
+    // After this step, prefetch experts that were used for the next step.
+    // This overlaps the copy with the host-side work between steps.
+    if (model.expert_cache && model.expert_cache->prefetch_enabled()) {
+        model.expert_cache->wait_prefetch(); // ensure previous prefetch is done
+
+        // Determine which experts to prefetch based on usage
+        // We use the most recently used experts per layer
+        const int64_t n_layers = model.expert_cache->n_layers();
+        const int64_t n_expert = model.expert_cache->n_expert();
+        const int64_t max_prefetch_per_layer = model.expert_cache->prefetch_slots() / n_layers + 1;
+
+        // For each layer, find the top experts by usage
+        std::vector<std::vector<int32_t>> per_layer_experts(n_layers);
+        for (int64_t layer = 0; layer < n_layers; ++layer) {
+            // Get top experts by usage for this layer
+            std::vector<std::pair<float, int32_t>> usage_pairs;
+            usage_pairs.reserve(n_expert);
+            for (int64_t expert = 0; expert < n_expert; ++expert) {
+                const float usage = model.expert_cache->get_usage(layer, expert);
+                if (usage > 0.0f) {
+                    usage_pairs.push_back({usage, (int32_t)expert});
+                }
+            }
+            // Sort by usage (descending)
+            std::sort(usage_pairs.begin(), usage_pairs.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+
+            // Take the top experts
+            const size_t n_take = std::min(usage_pairs.size(), (size_t)max_prefetch_per_layer);
+            for (size_t i = 0; i < n_take; ++i) {
+                per_layer_experts[layer].push_back(usage_pairs[i].second);
+            }
+        }
+
+        // Clear previous prefetch residency and schedule new prefetches
+        model.expert_cache->clear_prefetch_residency();
+        std::vector<const int32_t*> per_layer_ptrs(n_layers);
+        for (int64_t layer = 0; layer < n_layers; ++layer) {
+            per_layer_ptrs[layer] = per_layer_experts[layer].empty() ? nullptr : per_layer_experts[layer].data();
+        }
+
+        std::string pf_err;
+        int64_t scheduled = model.expert_cache->prefetch(per_layer_ptrs.data(), max_prefetch_per_layer, pf_err);
+        if (!pf_err.empty()) {
+            LLAMA_LOG_WARN("%s: expert cache prefetch failed: %s\n", __func__, pf_err.c_str());
+        } else if (scheduled > 0) {
+            LLAMA_LOG_DEBUG("%s: expert cache prefetch scheduled %lld experts\n",
+                            __func__, (long long)scheduled);
+        }
+    }
+
     return 0;
 }
 
@@ -2625,6 +2718,8 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
+        /*.expert_cache =*/ model.expert_cache ? model.expert_cache.get() : nullptr,
+        /*.kv_stream   =*/ model.kv_stream ? model.kv_stream.get() : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

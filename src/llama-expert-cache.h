@@ -1,0 +1,365 @@
+// llama-expert-cache.h - Adaptive VRAM expert tier for MoE models
+//
+// Implements Strata's R4 design: a pool of VRAM slots that hold the most-frequently
+// routed experts, with a residency table mapping (layer, expert) -> slot or -1.
+//
+// Multi-GPU tiers (Strata's "second GPU as another expert tier"):
+//   - Tier 0: main GPU (always present when cache is enabled)
+//   - Tier 1: second GPU (optional, holds warm experts not in tier 0)
+//   - Tier 2: third GPU (optional, holds cool experts not in tier 0 or 1)
+//   - Each tier has its own slot arena and residency table
+//   - The kernel checks tiers in order; first hit wins
+//
+// Key design decisions (from Strata measurements):
+//   - Per-layer slot ranges are MANDATORY: a shared pool starves all but the first few
+//     layers (2.97% hit rate for shared pool vs 21.4% for 8 slots/layer)
+//   - The kernel must handle a per-row hit/miss split because only 4.6% of (layer,token)
+//     pairs have all 10 experts resident
+//   - Eviction policy is a measured question (LFU-decay vs LRU sweep), not a placeholder
+//
+// The cache is populated at startup from a routing profile (tools/make_profile.py in Strata)
+// and can be adapted at runtime based on observed routing patterns.
+//
+// Runtime adaptation (Strata's adaptive_tier.cpp):
+//   - Tracks decayed routing usage per (layer, expert) pair
+//   - Periodically re-ranks experts and moves high-usage non-resident experts into
+//     the cache, evicting low-usage resident experts
+//   - Copies are performed asynchronously on a dedicated stream
+//   - Adaptation is triggered every N tokens or explicitly via adapt()
+
+#pragma once
+
+#include <cstdint>
+#include <cstddef>
+#include <string>
+#include <vector>
+#include <memory>
+
+struct ggml_tensor;
+struct ggml_backend_dev;
+
+// Slot index or -1 if not resident
+static constexpr int32_t LLAMA_EXPERT_NOT_RESIDENT = -1;
+
+// Maximum number of expert cache tiers (GPUs)
+static constexpr int LLAMA_EXPERT_MAX_TIERS = 3;
+
+// A single expert cache tier (one GPU)
+class llama_expert_cache_tier {
+public:
+    llama_expert_cache_tier() = default;
+    ~llama_expert_cache_tier();
+
+    llama_expert_cache_tier(const llama_expert_cache_tier&) = delete;
+    llama_expert_cache_tier& operator=(const llama_expert_cache_tier&) = delete;
+
+    llama_expert_cache_tier(llama_expert_cache_tier&& other) noexcept;
+    llama_expert_cache_tier& operator=(llama_expert_cache_tier&& other) noexcept;
+
+    // Open the tier with uniform slot sizes
+    bool open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
+              struct ggml_context* ctx, std::string& err);
+
+    void close();
+
+    bool valid() const { return slot_tensor_ != nullptr; }
+    int64_t slots() const { return slots_; }
+    int64_t resident() const { return per_layer_ ? admitted_ : next_free_; }
+    int64_t bytes() const { return off_.empty() ? slots_ * blob_ : (int64_t)off_.back(); }
+
+    // (layer, expert) -> slot index, or LLAMA_EXPERT_NOT_RESIDENT
+    int32_t slot_of(int64_t layer, int64_t expert) const;
+
+    // Claim the next free slot for (layer, expert)
+    int32_t admit(int64_t layer, int64_t expert);
+
+    // Evict (layer, expert) from the cache, freeing its slot
+    // Returns the slot that was freed, or LLAMA_EXPERT_NOT_RESIDENT if not resident
+    int32_t evict(int64_t layer, int64_t expert);
+
+    // Directly set residency for (layer, expert) to a specific slot
+    // Used for swaps where we evict one expert and admit another to the same slot
+    void set_residency(int64_t layer, int64_t expert, int32_t slot);
+
+    // Increment the admitted count (used after set_residency in swap operations)
+    void increment_admitted() { ++admitted_; }
+
+    void set_per_layer_admission(bool on) { per_layer_ = on; }
+    bool per_layer_admission() const { return per_layer_; }
+    void layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const;
+
+    void* device_slot(int32_t slot);
+    const void* device_slot(int32_t slot) const;
+
+    bool fill_slot_blocking(int32_t slot, const void* src, std::string& err, int64_t bytes = 0);
+
+    int64_t fills() const { return fills_; }
+
+    const int32_t* residency_table() const { return residency_.data(); }
+    struct ggml_tensor* residency_table_tensor() const { return residency_tensor_; }
+
+    // Get the slot tensor (for kernel access)
+    struct ggml_tensor* slot_tensor(struct ggml_context* graph_ctx, const ggml_tensor* w = nullptr) const;
+
+    int64_t n_layers() const { return n_layers_; }
+    int64_t n_expert() const { return n_expert_; }
+    int64_t blob_bytes() const { return blob_; }
+
+    // Set the maximum number of slots available for regular admissions.
+    // Slots beyond this limit are reserved (e.g., for prefetch).
+    void set_max_admit_slots(int64_t max_slots) { max_admit_slots_ = max_slots; }
+
+private:
+    struct ggml_context* ctx_ = nullptr;
+    struct ggml_tensor* slot_tensor_ = nullptr;
+    struct ggml_tensor* residency_tensor_ = nullptr;
+    void* base_ = nullptr;
+    std::vector<int32_t> residency_;   // [n_layers * n_expert] -> slot or LLAMA_EXPERT_NOT_RESIDENT
+    int64_t slots_ = 0;
+    int64_t n_layers_ = 0;
+    int64_t n_expert_ = 0;
+    int64_t blob_ = 0;
+    int64_t next_free_ = 0;
+    int64_t fills_ = 0;
+    bool per_layer_ = false;
+    std::vector<int32_t> layer_next_;  // [n_layers] -> that layer's next free slot
+    std::vector<uint64_t> off_;        // slot offsets when sized
+    int64_t admitted_ = 0;
+    int64_t max_admit_slots_ = 0;      // 0 = no limit (all slots available)
+};
+
+// Callback to copy expert weights from model tensors to a cache slot
+// layer: the layer index
+// expert: the expert index
+// slot_ptr: pointer to the slot memory to fill
+// slot_bytes: size of the slot
+// user_data: user-provided context (e.g., pointer to model)
+typedef void (*llama_expert_copy_fn)(int64_t layer, int64_t expert, void* slot_ptr,
+                                     int64_t slot_bytes, void* user_data);
+
+// Runtime adaptation configuration
+struct llama_expert_adapt_params {
+    int max_moves = 16;           // max experts to move per adaptation pass (Strata default)
+    float usage_threshold = 2.0f; // minimum usage for a non-resident expert to be a candidate
+    float swap_margin = 1.5f;     // candidate must exceed victim usage by this much to swap
+    float decay_factor = 0.7f;    // decay multiplier applied after each adaptation pass
+    int adapt_interval = 32;      // adapt every N tokens (0 = manual only)
+    llama_expert_copy_fn copy_fn = nullptr; // callback to copy expert weights
+    void* copy_user_data = nullptr;         // user data for the copy callback
+};
+
+// Expert cache: multi-tier slot storage and residency tables
+class llama_expert_cache {
+public:
+    llama_expert_cache() = default;
+    ~llama_expert_cache();
+
+    llama_expert_cache(const llama_expert_cache&) = delete;
+    llama_expert_cache& operator=(const llama_expert_cache&) = delete;
+
+    llama_expert_cache(llama_expert_cache&& other) noexcept;
+    llama_expert_cache& operator=(llama_expert_cache&& other) noexcept;
+
+    // ========================================================================
+    // Prefetch (Strata's second_gpu.cpp init_prefetch/prefetch)
+    //
+    // A small dedicated region of tier 1 slots used for experts that are likely
+    // to be needed soon but are not currently resident. Prefetch copies run on
+    // a separate CUDA stream so they overlap with the current step's computation.
+    // ========================================================================
+
+    // Initialize prefetch with N slots (reserved at the end of tier 1's arena).
+    // Must be called after open_tier(1) and before the first inference.
+    // Returns true on success.
+    bool init_prefetch(int64_t n_slots, std::string& err);
+
+    // Check if prefetch is initialized
+    bool prefetch_enabled() const { return prefetch_slots_ > 0; }
+
+    // Number of prefetch slots
+    int64_t prefetch_slots() const { return prefetch_slots_; }
+
+    // Start async copies of experts to prefetch slots.
+    // experts: array of [n_layers] pointers, each pointing to [n] expert IDs to prefetch for that layer
+    // n_per_layer: number of expert IDs per layer
+    // Returns the number of experts scheduled for prefetch.
+    int64_t prefetch(const int32_t* const* per_layer_experts, int64_t n_per_layer, std::string& err);
+
+    // Wait for all pending prefetch copies to complete.
+    // Must be called before executing the graph that uses the prefetched experts.
+    void wait_prefetch();
+
+    // Clear prefetch residency entries (called before each new prefetch round)
+    void clear_prefetch_residency();
+
+    // Get the prefetch slot tensor (for kernel access)
+    // This is a view of the prefetch region within tier 1's slot arena
+    struct ggml_tensor* prefetch_slot_tensor(struct ggml_context* graph_ctx, const ggml_tensor* w = nullptr) const;
+
+    // Offset of the first prefetch slot within tier 1's slot arena
+    int64_t prefetch_slot_offset() const { return prefetch_slot_offset_; }
+
+    // Open tier 0 (main GPU). Must be called before any other tier.
+    bool open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
+              struct ggml_context* ctx, std::string& err);
+
+    // Open an additional tier on a different GPU. Returns the tier index (1 or 2).
+    // device_idx: CUDA device index for this tier's GPU
+    int open_tier(int64_t n_slots, struct ggml_context* ctx, int device_idx, std::string& err);
+
+    void close();
+
+    bool valid() const { return tiers_[0].valid(); }
+    int num_tiers() const { return num_tiers_; }
+    int64_t slots(int tier = 0) const { return tier < num_tiers_ ? tiers_[tier].slots() : 0; }
+    int64_t resident(int tier = 0) const { return tier < num_tiers_ ? tiers_[tier].resident() : 0; }
+    int64_t total_resident() const;
+    int64_t bytes(int tier = 0) const { return tier < num_tiers_ ? tiers_[tier].bytes() : 0; }
+
+    // (layer, expert) -> (tier, slot) or (-1, LLAMA_EXPERT_NOT_RESIDENT)
+    // Searches tiers in order; first hit wins
+    void slot_of(int64_t layer, int64_t expert, int& tier, int32_t& slot) const;
+
+    // Claim a slot for (layer, expert), trying tiers in order
+    // Returns the tier index, or -1 if all full
+    int admit(int64_t layer, int64_t expert);
+
+    void set_per_layer_admission(bool on);
+    bool per_layer_admission() const { return tiers_[0].per_layer_admission(); }
+
+    void* device_slot(int tier, int32_t slot);
+    const void* device_slot(int tier, int32_t slot) const;
+
+    bool fill_slot_blocking(int tier, int32_t slot, const void* src, std::string& err, int64_t bytes = 0);
+
+    int64_t fills(int tier = 0) const { return tier < num_tiers_ ? tiers_[tier].fills() : 0; }
+
+    // Access tier's residency table directly
+    const int32_t* residency_table(int tier) const { return tier < num_tiers_ ? tiers_[tier].residency_table() : nullptr; }
+
+    // Get tier's residency table as a GGML tensor
+    struct ggml_tensor* residency_table_tensor(int tier) const { return tier < num_tiers_ ? tiers_[tier].residency_table_tensor() : nullptr; }
+
+    // Combined residency table encoding (tier, slot) for multi-tier kernel:
+    //   value >= 0:  tier 0, slot = value
+    //   value == -1: not resident
+    //   value <= -2: val = -value - 2; if val < tier1_slots → tier 1 slot=val;
+    //                else → tier 2 slot=val-tier1_slots
+    // Must be called after all tiers are populated. Creates a combined table
+    // in the given ggml context.
+    struct ggml_tensor* combined_residency_table(struct ggml_context* ctx) const;
+
+    // Get tier's slot tensor
+    struct ggml_tensor* slot_tensor(int tier, struct ggml_context* graph_ctx, const ggml_tensor* w = nullptr) const;
+
+    // Copy experts from a source tier to a destination tier (for P2P fallback).
+    // Experts that can't fit in the destination tier remain in the source tier.
+    // Returns the number of experts copied.
+    int64_t promote_tier_to(int src_tier, int dst_tier);
+
+    int64_t n_layers() const { return tiers_[0].n_layers(); }
+    int64_t n_expert() const { return tiers_[0].n_expert(); }
+    int64_t blob_bytes() const { return tiers_[0].blob_bytes(); }
+
+    // Tier access for kernel use
+    const llama_expert_cache_tier& tier(int i) const { return tiers_[i]; }
+
+    // ========================================================================
+    // Runtime admission and eviction (Strata's adaptive_tier.cpp)
+    // ========================================================================
+
+    // Enable runtime adaptation with the given parameters
+    // Must be called after open() and before the first inference
+    bool enable_adaptation(const llama_expert_adapt_params& params, std::string& err);
+
+    // Check if adaptation is enabled
+    bool adaptation_enabled() const { return adapt_params_ != nullptr; }
+
+    // Record that expert (layer, expert) was routed to
+    // Called during inference for each (layer, expert) pair that is used
+    void record_usage(int64_t layer, int64_t expert);
+
+    // Record usage for multiple experts at once (batched, more efficient)
+    // ids: array of [n_tokens * n_expert_used] expert IDs for a single layer
+    void record_usage_layer(int64_t layer, const int32_t* ids, int64_t n_entries);
+
+    // Record usage for all layers at once
+    // per_layer_ids: array of [n_layers] pointers, each pointing to [n_tokens * n_expert_used] expert IDs
+    void record_usage_all_layers(const int32_t* const* per_layer_ids, int64_t n_entries_per_layer);
+
+    // Record that N tokens were processed (for adaptation interval tracking)
+    void record_usage_tokens(int64_t n_tokens) {
+        if (adapt_params_ != nullptr) {
+            tokens_since_adapt_ += n_tokens;
+        }
+    }
+
+    // Manually trigger an adaptation pass
+    // Returns the number of experts moved
+    int64_t adapt(std::string& err);
+
+    // Check if adaptation should run based on token count
+    // Returns true if adapt() should be called
+    bool should_adapt() const;
+
+    // Get the current usage count for (layer, expert)
+    float get_usage(int64_t layer, int64_t expert) const;
+
+    // Get the total number of adaptation passes run
+    int64_t adapt_count() const { return adapt_count_; }
+
+    // Get the total number of experts admitted via runtime adaptation
+    int64_t runtime_admitted() const { return runtime_admitted_; }
+
+    // Get the total number of experts evicted via runtime adaptation
+    int64_t runtime_evicted() const { return runtime_evicted_; }
+
+    // Get the total number of experts swapped via runtime adaptation
+    int64_t runtime_swapped() const { return runtime_swapped_; }
+
+    // ========================================================================
+    // Expert usage tracking (captured during graph construction, applied after)
+    // ========================================================================
+
+    // Capture a selected_experts tensor for a layer during graph construction
+    void capture_expert_usage(int64_t layer, struct ggml_tensor* selected_experts);
+
+    // After graph computation, read back captured tensors and update usage
+    void apply_captured_usage();
+
+    // Clear captured usage entries
+    void clear_captured_usage() { captured_usage_.clear(); }
+
+private:
+    llama_expert_cache_tier tiers_[LLAMA_EXPERT_MAX_TIERS];
+    int num_tiers_ = 0;
+
+    // Prefetch state
+    int64_t prefetch_slots_ = 0;              // number of prefetch slots
+    int64_t prefetch_slot_offset_ = 0;        // offset within tier 1's arena
+    void* prefetch_stream_ = nullptr;         // separate CUDA stream for async copies
+    void* prefetch_event_ = nullptr;          // event recorded when prefetch copies complete
+    std::vector<int32_t> prefetch_residency_; // per-expert prefetch slot assignments (layer*expert -> slot or -1)
+
+    // Runtime adaptation state
+    std::unique_ptr<llama_expert_adapt_params> adapt_params_;
+    std::vector<float> usage_;             // [n_layers * n_expert] decayed routing counts
+    int64_t tokens_since_adapt_ = 0;
+    int64_t adapt_count_ = 0;
+    int64_t runtime_admitted_ = 0;
+    int64_t runtime_evicted_ = 0;
+    int64_t runtime_swapped_ = 0;
+
+    // Captured expert usage entries (layer, selected_experts tensor)
+    struct captured_usage_entry {
+        int64_t layer;
+        struct ggml_tensor* selected_experts;
+    };
+    std::vector<captured_usage_entry> captured_usage_;
+};
+
+// Read an expert profile from a file (Strata's STRP format)
+// Returns the ranked list of (layer, expert) pairs
+bool llama_read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
+                               std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err);
+

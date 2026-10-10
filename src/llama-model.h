@@ -6,6 +6,8 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
+#include "llama-expert-cache.h"
+#include "llama-kv-stream.h"
 
 #include <map>
 #include <memory>
@@ -743,6 +745,20 @@ struct llama_model {
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
+
+    // adaptive VRAM expert tier (Strata R4)
+    std::unique_ptr<llama_expert_cache> expert_cache;
+
+    // Runtime expert usage tracking (Strata adaptive_tier)
+    // Captured during graph construction, applied after computation
+    struct expert_usage_entry {
+        int64_t layer;
+        ggml_tensor * selected_experts;
+    };
+    std::vector<expert_usage_entry> expert_usage_entries;
+
+    // KV streaming (Strata's resident window)
+    std::unique_ptr<llama_kv_stream> kv_stream;
 
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
