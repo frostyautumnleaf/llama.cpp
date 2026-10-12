@@ -1,7 +1,50 @@
 # Strata port on `3x` - what works, what does not
 
-Measured on this branch against upstream `master` (now `c479922ac`, build 11481; the port itself was written
+Measured on this branch against upstream `master` (now `f2cc7282c`; the port itself was written
 against `cb7934c52`, build 11389) and Strata's own sources.
+
+## Upstream sync - 2026-10-12
+
+`3x` merged `upstream/master` = `f2cc7282c` on top of the previous sync point `c479922ac`: 101 upstream
+commits in, the port commits untouched below them. Everything stays on the fork - no upstream PR, and
+`upstream` is still configured with a disabled push URL so none can be opened by accident.
+
+Five conflicted files, all "both sides added something at the same place":
+
+- `src/llama-graph.{h,cpp}` - the port's expert-cache route of `build_lora_mm_id` (an `il` parameter and the
+  `GGML_OP_MUL_MAT_ID_CACHED` call) met upstream's MoE cache (`d6cf9acb2`, `c811cb8f0`: a `slots` parameter
+  that reads the host-resident experts from a device buffer). Combined: the signature is now
+  `(w, cur, ids, w_s, il, slots)`; upstream's `build_hadamard_input` runs for every path; when `slots` is
+  present the MoE cache wins, otherwise the expert-cache route, otherwise plain `mul_mat_id`. `llm_graph_params`
+  and `llm_graph_context` keep the port's `expert_cache`/`kv_stream` members next to upstream's `hdmd`.
+- `src/llama-context.{h,cpp}` - the includes and the graph-params initialiser keep both sides
+  (`llama-kv-stream.h` + `llama-moe-cache.h`, `expert_cache`/`kv_stream` + `hdmd`).
+- `tests/test-llama-archs.cpp` - `get_model_and_ctx` keeps the port's `load_mtp`/`n_rs_seq` and gains
+  upstream's `moe_cache_size` (last, so the port's call sites stay valid); the roundtrip call site was
+  updated for the new parameter order.
+
+Upstream changes that touch the ported code:
+
+- `448147d42` replaced qwen4exp's inline MTP-only detection with the shared `nextn_flags` helper, which also
+  accepts trunk-only files - taken over as-is; the port's MTP fixes (compress ratio of the nextn layer,
+  `out_ids` only when the batch has outputs, `k_idxs` kept in the graph) are intact next to it.
+- `781dbc5ac` made draft-mtp handle mtmd input and switched it to `set_embd_state` (a new `common_batch`
+  method; `set_embd` still exists for the draft-model path the port does not use).
+- `d6cf9acb2`/`c811cb8f0` add a *working* `--moe-cache-mib` for host-resident experts (LRU, per-GPU, filled
+  by the scheduler's copy callback). It coexists with the port's inert `--expert-cache*` arguments: the two
+  are separate features behind separate flags, and the MoE cache is the one to use today. Defects 1-7 below
+  still apply to the port's tier, and the "what a real port needs" list is unchanged - with one new data
+  point: upstream's slot-map + copy-callback design is a working reference for the same problem.
+- `c811cb8f0` also sets `moe_cache_size = 0` for the draft context in `common_base_params_to_speculative`, so
+  the cache never splits the target/draft graphs.
+
+Verified after the sync, CPU-only (the GPUs are busy and were not touched): the CPU Debug build and the
+ggml-cuda/llama/common targets of the CUDA Release build compile with no new warnings (the three
+set-but-unused warnings of the port's tier setters are pre-existing); `ctest` passes 65/65, including
+`test-mtp-draft-qwen4exp` ("MTP draft" OK alongside upstream's "Mixed batch") and the five port suites
+(`test-ngram-cache`, `test-ngram-suffix`, `test-spec-controller`, `test-spec-suffix`,
+`test-mul-mat-id-cached`); the inert Strata arguments still warn once and are ignored. The port's net delta
+against upstream is the same 43 files as before the sync, plus the two-line `build_lora_mm_id` combination.
 
 ## Upstream sync - 2026-10-07
 
