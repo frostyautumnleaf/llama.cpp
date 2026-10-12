@@ -75,7 +75,10 @@ void llama_model_saver::add_kv(const enum llm_kv key, const char value) {
 template <typename Container>
 void llama_model_saver::add_kv(const enum llm_kv key, const Container & value, const bool per_layer) {
     GGML_ASSERT(model != nullptr || !per_layer);
-    const size_t n_values = per_layer ? size_t(model->hparams.n_layer()) : value.size();
+    // block_count covers the MTP block and the loaders read per-layer arrays at that length, so writing the trunk
+    // alone produces a file a model with nextn layers refuses to load: "key ... has wrong array length" (the ratio
+    // array of an MTP file is the case the draft-mtp bug hides behind - see check_draft_mtp in test-llama-archs)
+    const size_t n_values = per_layer ? size_t(model->hparams.n_layer_all) : value.size();
     GGML_ASSERT(n_values <= value.size());
 
     if (n_values == 0) {

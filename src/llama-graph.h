@@ -24,8 +24,11 @@ struct llama_hadamard;
 
 class llama_moe_cache;
 
+#include "llama-expert-cache.h"
+
 struct llama_memory_context_i;
 
+class llama_kv_stream;
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_dsa_iswa_context;
@@ -806,6 +809,12 @@ struct llm_graph_params {
 
     const llama_hadamard * hdmd = nullptr;
 
+    // adaptive VRAM expert tier (Strata R4)
+    const llama_expert_cache * expert_cache = nullptr;
+
+    // KV streaming from RAM with resident window (Strata)
+    llama_kv_stream * kv_stream = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -969,6 +978,14 @@ public:
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
 
+    // Runtime expert usage tracking (Strata adaptive_tier)
+    // (layer, selected_experts) pairs captured during graph construction
+    struct expert_usage_entry {
+        int64_t layer;
+        ggml_tensor * selected_experts;
+    };
+    std::vector<expert_usage_entry> expert_usage;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
@@ -1059,6 +1076,12 @@ struct llm_graph_context {
 
     const llama_hadamard * hdmd;
 
+    // adaptive VRAM expert tier (Strata R4)
+    const llama_expert_cache * expert_cache;
+
+    // KV streaming from RAM with resident window (Strata)
+    llama_kv_stream * kv_stream;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -1083,6 +1106,15 @@ struct llm_graph_context {
         return inp_out_ids != nullptr && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
     }
 
+    // Record expert usage for runtime adaptation (Strata adaptive_tier)
+    // Captures the selected_experts tensor for a given layer in the graph result
+    // so usage can be recorded after graph computation
+    void record_expert_usage(int64_t layer, ggml_tensor * selected_experts) const {
+        if (expert_cache != nullptr && expert_cache->adaptation_enabled() && selected_experts != nullptr && res != nullptr) {
+            res->expert_usage.push_back({layer, selected_experts});
+        }
+    }
+
     //
     // common
     //
@@ -1103,12 +1135,16 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
+    // il is the decoder layer this matmul belongs to; the expert cache needs it because its
+    // residency table has one row per layer. Pass -1 when there is no layer to report, in which
+    // case the cache is not used.
     // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s   = nullptr,
+                      int   il    = -1,
               ggml_tensor * slots = nullptr) const;
 
     ggml_tensor * build_norm(

@@ -1551,9 +1551,56 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
-static void ggml_compute_forward_mul_mat_id(
+// MUL_MAT_ID_CACHED needs one extra thing on top of MUL_MAT_ID: for each expert it is about to
+// multiply, it has to ask the residency table where that expert's weights live - a slot in one of
+// the tier arenas, or the model weights. Everything else (grouping the rows by expert, converting
+// src1 to vec_dot_type, the chunking, the per-type vec_dot) is identical, so the two ops share the
+// body below and only differ in the base pointer used for a given expert.
+struct mmid_cache {
+    int32_t             layer;       // which row of the residency table this node reads
+    int32_t             tier1_slots;
+    const struct ggml_tensor * tier[3];     // arena views, tier[0] always present
+    const int32_t     * residency;   // [n_layers * n_expert], see ggml_mul_mat_id_cached()
+};
+
+// Resolve expert `cur_a` to the base pointer of its weights. Returns NULL if the residency entry
+// is inconsistent with the arenas, which is a bug in the cache rather than a runtime condition.
+static const char * ggml_mmid_cached_select(
+        const struct mmid_cache * cache, int64_t n_expert, int64_t cur_a, const char * orig) {
+    const int32_t enc = cache->residency[(int64_t) cache->layer * n_expert + cur_a];
+
+    if (enc == -1) {
+        return orig; // not resident
+    }
+
+    int slot;
+    const struct ggml_tensor * arena;
+
+    if (enc >= 0) {
+        slot  = enc;
+        arena = cache->tier[0];
+    } else {
+        const int32_t val = -enc - 2;
+        if (val < cache->tier1_slots) {
+            slot  = val;
+            arena = cache->tier[1];
+        } else {
+            slot  = val - cache->tier1_slots;
+            arena = cache->tier[2];
+        }
+    }
+
+    if (arena == NULL || slot < 0 || slot >= (int32_t) arena->ne[2]) {
+        return NULL;
+    }
+
+    return (const char *) arena->data + (size_t) slot * arena->nb[2];
+}
+
+static void ggml_compute_forward_mul_mat_id_impl(
         const struct ggml_compute_params * params,
-              struct ggml_tensor * dst) {
+              struct ggml_tensor * dst,
+        const struct mmid_cache * cache) {
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1675,12 +1722,20 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        // tiled takes over if profitable for this expert (see tiled.h)
-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+        // tiled takes over if profitable for this expert (see tiled.h). It reads dst->src[0]
+        // directly, so it cannot be used when the weights come from a cache slot.
+        if (!cache && ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        if (cache) {
+            src0_cur = ggml_mmid_cached_select(cache, n_as, cur_a, src0_cur);
+            if (src0_cur == NULL) {
+                GGML_ABORT("mul_mat_id_cached: residency entry for layer %d expert %lld does not resolve to a valid cache slot",
+                           cache->layer, (long long) cur_a);
+            }
+        }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1733,6 +1788,59 @@ static void ggml_compute_forward_mul_mat_id(
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
     }
+}
+
+// ggml_compute_forward_mul_mat_id_cached
+// MUL_MAT_ID where the weights for an expert may live in one of the cache's tier arenas instead of
+// in the model (Strata's expert cache). The residency table is indexed by (layer, expert), so the
+// node carries the layer it belongs to, and each arena is a per-projection view over the slot
+// storage.
+//
+// This used to be a hand-written scalar loop that read the cached *and* the original weights as
+// floats, so for any quantized src0 it multiplied raw quantized bytes and only F32/F16 came out
+// right. It is now the MUL_MAT_ID body with the per-expert base pointer resolved through the
+// residency table, which keeps the per-type vec_dot, the src1 conversion and the threading.
+
+static void ggml_compute_forward_mul_mat_id_cached(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0      = dst->src[0];
+    const struct ggml_tensor * residency = dst->src[4];
+
+    GGML_ASSERT(dst->src[3] != NULL && "mul_mat_id_cached: tier 0 arena is required");
+    GGML_ASSERT(residency->type == GGML_TYPE_I32);
+    GGML_ASSERT(residency->ne[0] % src0->ne[2] == 0);
+
+    // the arenas hold byte-for-byte copies of experts of src0, so they have to look exactly like
+    // src0 to the per-type vec_dot - assert it instead of multiplying garbage
+    for (int t = 0; t < 3; ++t) {
+        const struct ggml_tensor * arena = t == 0 ? dst->src[3] : (t == 1 ? dst->src[5] : dst->src[6]);
+        if (arena == NULL) {
+            continue;
+        }
+        GGML_ASSERT(arena->type  == src0->type);
+        GGML_ASSERT(arena->ne[0] == src0->ne[0] && arena->ne[1] == src0->ne[1]);
+        GGML_ASSERT(arena->nb[0] == src0->nb[0] && arena->nb[1] == src0->nb[1]);
+        GGML_ASSERT(arena->nb[2] >= src0->nb[2]);
+    }
+
+    struct mmid_cache cache;
+    cache.tier1_slots = ggml_get_op_params_i32(dst, 0);
+    cache.layer       = ggml_get_op_params_i32(dst, 1);
+    cache.tier[0]     = dst->src[3];
+    cache.tier[1]     = dst->src[5];
+    cache.tier[2]     = dst->src[6];
+    cache.residency   = (const int32_t *) residency->data;
+
+    GGML_ASSERT(cache.layer >= 0 && (int64_t) cache.layer < residency->ne[0] / src0->ne[2]);
+
+    ggml_compute_forward_mul_mat_id_impl(params, dst, &cache);
+}
+
+static void ggml_compute_forward_mul_mat_id(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    ggml_compute_forward_mul_mat_id_impl(params, dst, NULL);
 }
 
 /////////////////////////////////
@@ -1869,6 +1977,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
+            } break;
+        case GGML_OP_MUL_MAT_ID_CACHED:
+            {
+                ggml_compute_forward_mul_mat_id_cached(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2359,6 +2471,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ID_CACHED:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;
@@ -2891,6 +3004,7 @@ struct ggml_cplan ggml_graph_plan(
                         cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
                 case GGML_OP_MUL_MAT_ID:
+                case GGML_OP_MUL_MAT_ID_CACHED: // same body, so the same work buffer layout
                     {
                         cur = 0;
                         const struct ggml_tensor * src0 = node->src[0];
@@ -3098,6 +3212,179 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Optional per-op graph timing (GGML_CPU_OP_TIMING=1): dumps a table of the
+// cumulative critical-path time per op type to stderr. Thread 0 measures the
+// node + barrier wall time, every thread measures the time it spent inside the
+// node, and the number of threads that entered a node is counted so that ops
+// which are effectively serial are visible.
+// ---------------------------------------------------------------------------
+#define GGML_CPU_OP_PROF_MAX_NODES 8192
+
+struct ggml_cpu_op_prof_entry {
+    atomic_llong us_all;  // sum of time every thread spent in this op
+    atomic_llong us_wall; // thread 0: node + barrier wall time
+    atomic_llong n;       // node instances
+    atomic_llong nth;     // sum of participating threads per node instance
+};
+
+static struct ggml_cpu_op_prof_entry g_cpu_op_prof[GGML_OP_COUNT];
+static atomic_int g_cpu_op_prof_part[GGML_CPU_OP_PROF_MAX_NODES];
+static atomic_llong g_cpu_op_prof_graphs;
+static int g_cpu_op_prof_enabled = -1;
+
+static void ggml_cpu_op_prof_init(void) {
+    const char * env = getenv("GGML_CPU_OP_TIMING");
+    g_cpu_op_prof_enabled = (env && strcmp(env, "0") != 0) ? 1 : 0;
+}
+
+// per-shape table: which (op, src0 type, dims) instances cost the most, and how many MAC/s they
+// actually deliver - this is what tells you whether a slow op is slow per node or just called a lot
+#define GGML_CPU_SHAPE_PROF_SLOTS 192
+
+struct ggml_cpu_shape_prof_entry {
+    int      op;
+    int      t0;
+    int64_t  ne00, ne01, ne02, ne11, ne2, ne21;
+    long long wall_us;
+    long long n;
+    const char * name;   // src0 name if it is a weight (helps attribute the time to a tensor)
+    int      nth;        // max participating threads seen
+};
+
+static struct ggml_cpu_shape_prof_entry g_shape_prof[GGML_CPU_SHAPE_PROF_SLOTS];
+
+static void ggml_cpu_shape_prof_add(const struct ggml_tensor * node, long long us, int nth) {
+    const struct ggml_tensor * src0 = node->src[0];
+    const struct ggml_tensor * src1 = node->src[1];
+
+    const int64_t ne00 = src0 ? src0->ne[0] : 0;
+    const int64_t ne01 = src0 ? src0->ne[1] : 0;
+    const int64_t ne02 = src0 ? src0->ne[2] : 0;
+    const int64_t ne11 = src1 ? src1->ne[1] : 0;
+    const int64_t ne21 = node->ne[1];
+    const int64_t ne2  = node->ne[2];
+    const int     t0   = src0 ? (int) src0->type : -1;
+
+    uint64_t h = (uint64_t) node->op * 1000003u + (uint64_t) t0 * 7919u;
+    h = h * 1000003u + (uint64_t) ne00;
+    h = h * 1000003u + (uint64_t) ne01;
+    h = h * 1000003u + (uint64_t) ne11;
+    h = h * 1000003u + (uint64_t) ne02;
+
+    for (int i = 0; i < GGML_CPU_SHAPE_PROF_SLOTS; i++) {
+        const int slot = (int) ((h + i) % GGML_CPU_SHAPE_PROF_SLOTS);
+        struct ggml_cpu_shape_prof_entry * e = &g_shape_prof[slot];
+        if (e->n == 0) {
+            e->op = node->op; e->t0 = t0;
+            e->name = (src0 && ggml_is_quantized(src0->type)) || (src0 && src0->op == GGML_OP_NONE) ? ggml_get_name(src0) : NULL;
+            e->nth = nth;
+            e->ne00 = ne00; e->ne01 = ne01; e->ne02 = ne02;
+            e->ne11 = ne11; e->ne2 = ne2; e->ne21 = ne21;
+            e->wall_us = us; e->n = 1;
+            return;
+        }
+        if (e->op == (int) node->op && e->t0 == t0 && e->ne00 == ne00 && e->ne01 == ne01 &&
+            e->ne02 == ne02 && e->ne11 == ne11 && e->ne2 == ne2 && e->ne21 == ne21) {
+            e->wall_us += us;
+            e->n++;
+            if (nth > e->nth) { e->nth = nth; }
+            return;
+        }
+    }
+}
+
+static void ggml_cpu_shape_prof_dump(double tot) {
+    // sort by wall time (insertion sort, the table is small)
+    for (int i = 1; i < GGML_CPU_SHAPE_PROF_SLOTS; i++) {
+        struct ggml_cpu_shape_prof_entry key = g_shape_prof[i];
+        int j = i - 1;
+        while (j >= 0 && g_shape_prof[j].wall_us < key.wall_us) {
+            g_shape_prof[j + 1] = g_shape_prof[j];
+            j--;
+        }
+        g_shape_prof[j + 1] = key;
+    }
+
+    fprintf(stderr, "\n[op-prof] per-shape (top 24):\n");
+    fprintf(stderr, "[op-prof] %-18s %-8s %-22s %10s %8s %10s %10s\n",
+            "op", "type", "shape", "wall_ms", "n", "ms/node", "GFLOP/s");
+    for (int i = 0; i < GGML_CPU_SHAPE_PROF_SLOTS; i++) {
+        const struct ggml_cpu_shape_prof_entry * e = &g_shape_prof[i];
+        if (e->n == 0 || e->wall_us <= 0) {
+            break;
+        }
+        // MAC count: matmul-like ops dominate the list, for the rest the number is meaningless
+        double macs = 0.0;
+        if (e->op == GGML_OP_MUL_MAT) {
+            macs = (double) e->n * e->ne00 * e->ne01 * e->ne11 * (e->ne2 > 0 ? e->ne2 : 1);
+        } else if (e->op == GGML_OP_MUL_MAT_ID) {
+            // ids are [n_expert_used, n_tokens], dst is [ne01, n_expert_used, n_tokens]
+            macs = (double) e->n * e->ne00 * e->ne01 * e->ne21 * (e->ne2 > 0 ? e->ne2 : 1);
+        }
+        const double wall_s = e->wall_us / 1e6;
+        const double gflops = wall_s > 0.0 ? 2.0 * macs / wall_s / 1e9 : 0.0;
+        fprintf(stderr, "[op-prof] %-18s %-8s [%6lld,%6lld,%6lld]x[%6lld]->[%6lld,%6lld] %10.1f %8lld %10.3f %10.1f  (%.1f%%)\n",
+                ggml_op_name(e->op), ggml_type_name((enum ggml_type) (e->t0 < 0 ? 0 : e->t0)),
+                (long long) e->ne00, (long long) e->ne01, (long long) e->ne02, (long long) e->ne11,
+                (long long) e->ne21, (long long) e->ne2,
+                e->wall_us / 1e3, (long long) e->n, e->wall_us / 1e3 / e->n, gflops,
+                tot > 0.0 ? 100.0 * e->wall_us / 1e3 / tot : 0.0);
+        if (e->name && e->name[0]) {
+            fprintf(stderr, "[op-prof]       src0 = %s (nth=%d)\n", e->name, e->nth);
+        }
+    }
+}
+
+static void ggml_cpu_op_prof_dump(void) {
+    if (!g_cpu_op_prof_enabled) {
+        return;
+    }
+
+    int idx[GGML_OP_COUNT];
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        idx[i] = i;
+    }
+
+    double tot = 0.0;
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        tot += atomic_load(&g_cpu_op_prof[i].us_wall) / 1e3;
+    }
+
+    fprintf(stderr, "\n[op-prof] graphs = %lld, total = %.1f ms\n", (long long) atomic_load(&g_cpu_op_prof_graphs), tot);
+    fprintf(stderr, "[op-prof] %-20s %10s %10s %10s %8s\n", "op", "wall_ms", "pct", "nodes", "avg_nth");
+
+    for (int a = 0; a < GGML_OP_COUNT; a++) {
+        for (int b = a + 1; b < GGML_OP_COUNT; b++) {
+            if (atomic_load(&g_cpu_op_prof[idx[b]].us_wall) > atomic_load(&g_cpu_op_prof[idx[a]].us_wall)) {
+                int t = idx[a]; idx[a] = idx[b]; idx[b] = t;
+            }
+        }
+        if (atomic_load(&g_cpu_op_prof[idx[a]].us_wall) == 0) {
+            break;
+        }
+    }
+
+    for (int a = 0; a < GGML_OP_COUNT; a++) {
+        const int i = idx[a];
+        const double wall = atomic_load(&g_cpu_op_prof[i].us_wall) / 1e3;
+        if (wall <= 0.0) {
+            break;
+        }
+        const double all  = atomic_load(&g_cpu_op_prof[i].us_all) / 1e3;
+        const long long n = atomic_load(&g_cpu_op_prof[i].n);
+        const double nth  = n ? (double) atomic_load(&g_cpu_op_prof[i].nth) / n : 0.0;
+        fprintf(stderr, "[op-prof] %-20s %10.1f %9.1f%% %10lld %8.2f   (thread-sum %9.1f ms)\n",
+                ggml_op_name(i), wall, tot > 0.0 ? 100.0 * wall / tot : 0.0, n, nth, all);
+    }
+
+    ggml_cpu_shape_prof_dump(tot);
+
+    fflush(stderr);
+}
+
+// ---------------------------------------------------------------------------
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3138,6 +3425,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        const bool prof = g_cpu_op_prof_enabled == 1;
+        const int64_t prof_t0 = prof ? ggml_time_us() : 0;
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3145,6 +3435,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
+
+        if (prof && node_n < GGML_CPU_OP_PROF_MAX_NODES) {
+            atomic_fetch_add(&g_cpu_op_prof_part[node_n], 1);
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3156,6 +3450,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+
+        if (prof) {
+            const int64_t prof_t1 = ggml_time_us();
+            struct ggml_cpu_op_prof_entry * e = &g_cpu_op_prof[node->op];
+            atomic_fetch_add(&e->us_all, (long long) (prof_t1 - prof_t0));
+            if (state->ith == 0) {
+                atomic_fetch_add(&e->us_wall, (long long) (prof_t1 - prof_t0));
+                atomic_fetch_add(&e->n, 1);
+                if (node_n < GGML_CPU_OP_PROF_MAX_NODES) {
+                    atomic_fetch_add(&e->nth, atomic_exchange(&g_cpu_op_prof_part[node_n], 0));
+                }
+                ggml_cpu_shape_prof_add(node, (long long) (prof_t1 - prof_t0), atomic_load(&g_cpu_op_prof_part[node_n]) );
+            }
+        }
     }
 
 #ifdef GGML_USE_OPENMP
@@ -3165,6 +3473,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+
+    if (g_cpu_op_prof_enabled && state->ith == 0) {
+        const long long g = atomic_load(&g_cpu_op_prof_graphs);
+        if (g % 2 == 0 || g == 1) {
+            ggml_cpu_op_prof_dump();
+        }
+    }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
@@ -3390,6 +3705,13 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
+
+    if (g_cpu_op_prof_enabled < 0) {
+        ggml_cpu_op_prof_init();
+    }
+    if (g_cpu_op_prof_enabled) {
+        atomic_fetch_add(&g_cpu_op_prof_graphs, 1);
+    }
 
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
