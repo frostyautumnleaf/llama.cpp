@@ -599,6 +599,22 @@ struct common_params {
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
+    // stream the routed experts in and out of RAM from disk instead of letting the operating
+    // system page a too-big model in blindly (see llama-expert-stream.h)
+    struct common_params_expert_stream {
+        size_t budget = 0;        // bytes of RAM the routed experts may occupy, 0 = off
+        int    io_threads = 8;    // whole experts read in parallel, this many at a time
+        enum llama_expert_policy policy = LLAMA_EXPERT_POLICY_ADMIT;
+        double half_life = 256;   // usage-frequency half-life, in decode steps
+        bool   async_evict = true;     // page out on a background thread
+        bool   prefetch = true;        // read whole experts before the mat-mul needs them
+        bool   pageout = false;        // MADV_PAGEOUT instead of MADV_DONTNEED + fadvise
+        bool   check_residency = true; // ask the kernel whether an expert is really resident
+        bool   cold = true;            // drop every routed expert before the first decode
+        std::string heat_in;           // preload the hot set and seed the counts from this file
+        std::string heat_out;          // write per-expert heat here when the model is unloaded
+    } expert_stream;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

@@ -6,6 +6,7 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
+#include "llama-expert-stream.h"
 
 #include <map>
 #include <memory>
@@ -904,6 +905,9 @@ struct llama_model {
     std::vector<int32_t> target_layer_ids;
 
     std::vector<llama_layer> layers;
+
+    // where the routed experts lie in the file, filled at load time; see llama-expert-stream.h
+    llama_expert_pool expert_pool;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see

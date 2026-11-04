@@ -39,6 +39,9 @@ struct llama_file {
 
     size_t read_alignment() const;
     bool has_direct_io() const;
+
+    // the path the file was opened from; "(file*)" when it came from a FILE *
+    const std::string & path() const;
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

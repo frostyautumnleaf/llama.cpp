@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-expert-stream.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -62,6 +63,9 @@ struct llama_context {
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
+
+    // counters of the routed-expert streaming engine, zeroed when it is off
+    void expert_stream_stats(llama_expert_stream_stats * stats) const;
 
     ggml_backend_sched_t get_sched() const;
 
@@ -319,6 +323,15 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+
+    // routed experts streamed from disk, null when streaming is off; see llama-expert-stream.h
+    std::unique_ptr<llama_expert_stream> expert_stream;
+
+    // the scheduler callback that drives the streamer, wrapping any callback the caller set
+    static bool expert_stream_eval_cb(ggml_tensor * t, bool ask, void * user_data);
+
+    // the router of a layer has chosen its experts; fetch the missing ones before the mat-muls
+    void expert_stream_selected(ggml_tensor * t);
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

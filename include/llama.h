@@ -362,6 +362,65 @@ extern "C" {
         struct llama_sampler * sampler;
     };
 
+    //
+    // Expert streaming (lossless MoE expert streaming from disk)
+    //
+    // A Mixture-of-Experts model is huge on disk and small per token: only a few routed experts
+    // are touched by any one token. When the model is memory-mapped and the weights are not
+    // repacked, every routed expert is a window of the file, so it can be brought into the page
+    // cache whole, in parallel, the moment the router picks it, and dropped again when it goes
+    // cold. The weights are never copied or approximated, so the answers are the exact ones.
+    //
+
+    enum llama_expert_policy {
+        LLAMA_EXPERT_POLICY_LRU   = 0, // keep whatever was used least recently
+        LLAMA_EXPERT_POLICY_ADMIT = 1, // ... and only admit a missed expert if it is used more
+                                       // often than the one it would evict (TinyLFU style)
+    };
+
+    struct llama_expert_stream_params {
+        size_t budget_bytes;     // RAM the routed experts may occupy, 0 = streaming disabled
+        int    io_threads;       // parallel whole-expert fetchers
+        enum llama_expert_policy policy;
+        double half_life;        // usage-frequency half-life in decode steps (1 step = 1 ubatch)
+        bool   async_evict;      // page out on a background thread instead of in the decode path
+        bool   prefetch;         // read whole experts ahead of the mat-mul; off leaves the paging
+                                 // to the kernel, which faults each expert in 4 KiB at a time
+        bool   pageout;          // MADV_PAGEOUT instead of MADV_DONTNEED + POSIX_FADV_DONTNEED
+        bool   check_residency;  // ask the kernel (mincore) whether an expert is really resident
+        bool   cold;             // drop every routed expert before the first decode
+        const char * heat_in;    // seed the preload and the usage counts from a heat file
+        const char * heat_out;   // write per-expert heat when the context is freed
+    };
+
+    LLAMA_API struct llama_expert_stream_params llama_expert_stream_default_params(void);
+
+    struct llama_expert_stream_stats {
+        uint64_t accesses;        // expert uses seen
+        uint64_t hits;            // ... that were already resident
+        uint64_t misses;          // ... that had to be fetched
+        uint64_t evictions;       // experts dropped from the budget
+        uint64_t rejected;        // missed experts that were used but not kept
+        uint64_t fetched_bytes;   // bytes pulled in because a router asked for them
+        uint64_t disk_read_bytes; // bytes the kernel actually read for the measured window
+        uint64_t resident_checked;
+        uint64_t resident_true;   // mincore ground truth: accesses already fully resident
+        double   fetch_seconds;   // time spent waiting for whole-expert reads
+        double   evict_seconds;
+        double   callback_seconds;
+        size_t   resident_bytes;  // bytes currently held under the budget
+        size_t   budget_bytes;
+        size_t   pool_bytes;      // all routed experts of the model
+        int32_t  n_layer_moe;
+        int32_t  n_expert;
+    };
+
+    // Read the counters of the streaming engine of this context; does nothing when streaming is
+    // disabled. Safe to call from any thread.
+    LLAMA_API void llama_expert_stream_get_stats(
+            const struct llama_context * ctx,
+            struct llama_expert_stream_stats * stats);
+
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
@@ -398,6 +457,9 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+
+        // routed-expert streaming from disk; budget_bytes == 0 (default) disables it
+        struct llama_expert_stream_params expert_stream;
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

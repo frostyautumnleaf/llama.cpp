@@ -2130,6 +2130,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // record where the routed experts lie while the mappings are still ours to read; a context
+    //     may stream them from disk later, see llama-expert-stream.h
+    llama_expert_pool_build(*this, ml, expert_pool);
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));

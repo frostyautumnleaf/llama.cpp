@@ -1733,6 +1733,28 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
+    if (params.expert_stream.budget > 0) {
+        // streamed experts have to stay exactly where the file has them: repacking copies them
+        //     out of the mapping into memory of its own, which cannot be paged out again
+        mparams.use_extra_bufts = false;
+        if (params.n_gpu_layers > 0) {
+            // dense layers and the KV cache go to the GPU, the routed experts stay in host
+            //     memory, where the streamer can reach them (same split as --n-cpu-moe)
+            bool pinned = false;
+            for (const auto & o : params.tensor_buft_overrides) {
+                if (o.pattern && strcmp(o.pattern, LLM_FFN_EXPS_REGEX) == 0) {
+                    pinned = true;
+                    break;
+                }
+            }
+            if (!pinned) {
+                params.tensor_buft_overrides.insert(
+                    params.tensor_buft_overrides.begin(),
+                    llama_model_tensor_buft_override{ LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() });
+            }
+        }
+    }
+
     return mparams;
 }
 
@@ -1773,6 +1795,20 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     cparams.moe_cache_size = params.moe_cache_size;
+
+    if (params.expert_stream.budget > 0) {
+        cparams.expert_stream.budget_bytes    = params.expert_stream.budget;
+        cparams.expert_stream.io_threads      = params.expert_stream.io_threads;
+        cparams.expert_stream.policy          = params.expert_stream.policy;
+        cparams.expert_stream.half_life       = params.expert_stream.half_life;
+        cparams.expert_stream.async_evict     = params.expert_stream.async_evict;
+        cparams.expert_stream.prefetch        = params.expert_stream.prefetch;
+        cparams.expert_stream.pageout         = params.expert_stream.pageout;
+        cparams.expert_stream.check_residency = params.expert_stream.check_residency;
+        cparams.expert_stream.cold            = params.expert_stream.cold;
+        cparams.expert_stream.heat_in         = params.expert_stream.heat_in.empty()  ? nullptr : params.expert_stream.heat_in.c_str();
+        cparams.expert_stream.heat_out        = params.expert_stream.heat_out.empty() ? nullptr : params.expert_stream.heat_out.c_str();
+    }
 
     return cparams;
 }

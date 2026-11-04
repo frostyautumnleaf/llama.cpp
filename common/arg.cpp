@@ -2735,6 +2735,103 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--expert-budget"}, "MIB",
+        "stream a Mixture-of-Experts model bigger than RAM through this much memory for its routed experts: a whole expert is\n"
+        "read from disk the moment the router picks it, and dropped again when it goes cold. The weights are never copied,\n"
+        "re-quantized or approximated, so the answers are exactly the ones the file holds. Needs mmap (the default)\n"
+        "(default: 0, streaming off)\n",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_stream.budget = (size_t) value * 1024 * 1024;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_BUDGET"));
+    add_opt(common_arg(
+        {"--expert-io-threads"}, "N",
+        string_format("number of experts read from disk in parallel while streaming (default: %d)", params.expert_stream.io_threads),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_stream.io_threads = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_IO_THREADS"));
+    add_opt(common_arg(
+        {"--expert-policy"}, "POLICY",
+        string_format("which expert to keep when the budget is full: lru, or admit, which keeps a missed expert only if it is\n"
+                      "used more often than the one it would evict (default: %s)",
+                      params.expert_stream.policy == LLAMA_EXPERT_POLICY_ADMIT ? "admit" : "lru"),
+        [](common_params & params, const std::string & value) {
+            if (value == "lru") {
+                params.expert_stream.policy = LLAMA_EXPERT_POLICY_LRU;
+            } else if (value == "admit") {
+                params.expert_stream.policy = LLAMA_EXPERT_POLICY_ADMIT;
+            } else {
+                throw std::invalid_argument("invalid value, expected 'lru' or 'admit'");
+            }
+        }
+    ).set_env("LLAMA_ARG_EXPERT_POLICY"));
+    add_opt(common_arg(
+        {"--expert-half-life"}, "N",
+        string_format("how many decode steps a recently used expert stays interesting for (default: %.0f)",
+                      params.expert_stream.half_life),
+        [](common_params & params, const std::string & value) {
+            params.expert_stream.half_life = std::stod(value);
+        }
+    ).set_env("LLAMA_ARG_EXPERT_HALF_LIFE"));
+    add_opt(common_arg(
+        {"--expert-heat-in"}, "FILE",
+        "preload the hot set and seed the usage counts from a heat file written by --expert-heat-out (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.expert_stream.heat_in = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_HEAT_IN"));
+    add_opt(common_arg(
+        {"--expert-heat-out"}, "FILE",
+        "write the per-expert usage counts of the run here, to warm up the next one with --expert-heat-in (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.expert_stream.heat_out = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_HEAT_OUT"));
+    add_opt(common_arg(
+        {"--expert-warm"},
+        "keep whatever the operating system already has of the experts instead of dropping it all before the first token\n",
+        [](common_params & params) {
+            params.expert_stream.cold = false;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_WARM"));
+    add_opt(common_arg(
+        {"--expert-sync-evict"},
+        "page cold experts out in the decode path instead of on a background thread (slower; useful for measuring)\n",
+        [](common_params & params) {
+            params.expert_stream.async_evict = false;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_SYNC_EVICT"));
+    add_opt(common_arg(
+        {"--expert-no-prefetch"},
+        "keep the expert budget but let the kernel page each expert in by itself instead of reading it whole and in parallel;\n"
+        "slower, and only there to measure what the prefetch is worth\n",
+        [](common_params & params) {
+            params.expert_stream.prefetch = false;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_NO_PREFETCH"));
+    add_opt(common_arg(
+        {"--expert-pageout"},
+        "reclaim cold experts with MADV_PAGEOUT instead of MADV_DONTNEED + POSIX_FADV_DONTNEED\n",
+        [](common_params & params) {
+            params.expert_stream.pageout = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_PAGEOUT"));
+    add_opt(common_arg(
+        {"--expert-no-residency"},
+        "do not ask the kernel whether an expert really is resident; cheaper to measure, and the hit rate is then only the\n"
+        "engine's own bookkeeping (default: checked)\n",
+        [](common_params & params) {
+            params.expert_stream.check_residency = false;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_NO_RESIDENCY"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

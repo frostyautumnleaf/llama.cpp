@@ -615,6 +615,19 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
+        if (params.expert_stream.budget_bytes > 0) {
+            expert_stream = std::make_unique<llama_expert_stream>(model, params.expert_stream);
+            if (!expert_stream->enabled()) {
+                LLAMA_LOG_WARN("%s: expert streaming is off: %s\n", __func__, expert_stream->error().c_str());
+                expert_stream.reset();
+            } else {
+                llama_expert_stream_stats s;
+                expert_stream->get_stats(&s);
+                LLAMA_LOG_INFO("%s: streaming %d MoE layers x %d experts (%.2f GB) under a %.2f GB budget\n",
+                        __func__, (int) s.n_layer_moe, (int) s.n_expert, s.pool_bytes / 1e9, s.budget_bytes / 1e9);
+            }
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -636,6 +649,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (expert_stream) {
+        expert_stream->log_stats();
+    }
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -1704,7 +1721,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (expert_stream) {
+            // the streamer needs the router's choices before the expert mat-muls run, and any
+            //     callback the caller set still gets every node
+            ggml_backend_sched_set_eval_callback(sched.get(), expert_stream_eval_cb, this);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -3066,6 +3089,105 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     return true;
 }
 
+//
+// Routed-expert streaming
+//
+// The graph names the router output of every MoE layer ffn_moe_topk-<il>. Asking the scheduler
+// for that node makes it compute up to the router, wait for the result and hand it over, which
+// is the one moment where the experts this ubatch needs are known and the mat-muls that read
+// them have not started yet. Everything the streamer does - whole-expert reads in parallel, a
+// byte budget, eviction - hangs off that point.
+//
+
+static bool llama_expert_stream_is_topk(const ggml_tensor * t, int & il) {
+    static const char prefix[] = "ffn_moe_topk-";
+    const size_t n = sizeof(prefix) - 1;
+    if (strncmp(t->name, prefix, n) != 0) {
+        return false;
+    }
+    char * end = nullptr;
+    const long v = strtol(t->name + n, &end, 10);
+    if (end == t->name + n || *end != '\0') {
+        return false;
+    }
+    il = (int) v;
+    return true;
+}
+
+// static
+bool llama_context::expert_stream_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+    llama_context * ctx = (llama_context *) user_data;
+
+    int il = -1;
+    const bool topk = llama_expert_stream_is_topk(t, il);
+
+    if (ask) {
+        // the router is only interesting while its experts have yet to be read
+        bool need = topk;
+        if (ctx->cparams.cb_eval) {
+            need = ctx->cparams.cb_eval(t, true, ctx->cparams.cb_eval_user_data) || need;
+        }
+        return need;
+    }
+
+    if (topk) {
+        ctx->expert_stream_selected(t);
+    }
+    if (ctx->cparams.cb_eval) {
+        return ctx->cparams.cb_eval(t, false, ctx->cparams.cb_eval_user_data);
+    }
+    return true;
+}
+
+void llama_context::expert_stream_selected(ggml_tensor * t) {
+    int il = -1;
+    if (!expert_stream || !llama_expert_stream_is_topk(t, il) || t->type != GGML_TYPE_I32) {
+        return;
+    }
+
+    const int64_t k = t->ne[0];
+    const int64_t T = t->ne[1];
+    if (k <= 0 || T <= 0) {
+        return;
+    }
+
+    // the router may have run on a GPU, in which case the ids have to come off it first
+    std::vector<uint8_t> staging;
+    const uint8_t * base = (const uint8_t *) t->data;
+    if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+        staging.resize((size_t) ggml_nbytes(t));
+        ggml_backend_tensor_get(t, staging.data(), 0, staging.size());
+        base = staging.data();
+    }
+
+    std::vector<int32_t> ids;
+    ids.reserve((size_t) (k * T));
+    for (int64_t j = 0; j < T; j++) {
+        for (int64_t i = 0; i < k; i++) {
+            int32_t v;
+            memcpy(&v, base + i * t->nb[0] + j * t->nb[1], sizeof(int32_t));
+            ids.push_back(v);
+        }
+    }
+
+    expert_stream->on_selected(il, ids.data(), ids.size(), T);
+}
+
+void llama_context::expert_stream_stats(llama_expert_stream_stats * stats) const {
+    if (expert_stream) {
+        expert_stream->get_stats(stats);
+    } else {
+        *stats = llama_expert_stream_stats{};
+    }
+}
+
+void llama_expert_stream_get_stats(const struct llama_context * ctx, struct llama_expert_stream_stats * stats) {
+    if (!ctx || !stats) {
+        return;
+    }
+    ctx->expert_stream_stats(stats);
+}
+
 llm_graph_cb llama_context::graph_get_cb() const {
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
@@ -4270,6 +4392,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.expert_stream               =*/ llama_expert_stream_default_params(),
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

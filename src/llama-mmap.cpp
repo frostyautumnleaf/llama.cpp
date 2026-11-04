@@ -85,6 +85,7 @@ struct llama_file::impl {
     }
 
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
+        path_str = fname;
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -96,6 +97,7 @@ struct llama_file::impl {
     }
 
     impl(FILE * file) : owns_fp(false) {
+        path_str = "(file*)";
         fp = file;
         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
         seek(0, SEEK_END);
@@ -182,6 +184,7 @@ struct llama_file::impl {
     }
 #else
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
+        path_str = fname;
 #ifdef __linux__
         // Try unbuffered I/O for read only
         if (use_direct_io && std::strcmp(mode, "rb") == 0) {
@@ -227,6 +230,7 @@ struct llama_file::impl {
     }
 
     impl(FILE * file) : fname("(file*)"), owns_fp(false) {
+        path_str = "(file*)";
         fp = file;
         seek(0, SEEK_END);
         size = tell();
@@ -407,6 +411,9 @@ struct llama_file::impl {
     FILE * fp{};
     size_t size{};
     bool owns_fp = true;
+
+    // where the file came from, for anything that has to reopen it (see llama-expert-stream)
+    std::string path_str;
 };
 
 llama_file::llama_file(const char * fname, const char * mode, const bool use_direct_io) :
@@ -421,6 +428,8 @@ size_t llama_file::size() const { return pimpl->size; }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+
+const std::string & llama_file::path() const { return pimpl->path_str; }
 
 int llama_file::file_id() const {
 #ifdef _WIN32
